@@ -1,0 +1,13 @@
+# TQ1 k=2 routed experts (3.45 b/w versus 4.25 b/w source); lossless elsewhere
+# that the Mode B exporter supports. Non-weight tensors remain in their source format.
+name: experts-k2-lossless-rest
+default: {mode: B}
+rules:
+  - match: '^layers\.\d+\.ffn\.experts\.\d+\.w[123]$'
+    mode: C
+    k: 2
+    group: 128
+    packing: tq1
+    scale_dtype: fp16
+    act: int8
+    gptq: false

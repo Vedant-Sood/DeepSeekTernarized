@@ -49,6 +49,7 @@ Shipped policies (`configs/policy/`):
 | `experts_k1.yaml` | routed experts, TQ1 k=1 | 1.725 |
 | `experts_engram_k2.yaml` | routed experts and both engram tables, TQ1 k=2 | 3.45 |
 | `lossless.yaml` | every weight Mode B | n/a |
+| `experts_k2_lossless_rest.yaml` | routed experts Mode C; other supported weights Mode B | 3.45 for experts |
 
 ## Stored tensors per mode
 
