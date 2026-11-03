@@ -123,14 +123,42 @@ def encode(t: torch.Tensor, maxlen: int = MAXLEN, block: int = BLOCK) -> dict[st
     return out
 
 
-def decode(parts: dict[str, torch.Tensor], n_symbols: int, maxlen: int = MAXLEN, block: int = BLOCK) -> torch.Tensor:
-    """-> the original bytes (uint8, flat)."""
+def decode(parts: dict[str, torch.Tensor], n_symbols: int, maxlen: int = MAXLEN, block: int = BLOCK,
+           *, out: torch.Tensor | None = None) -> torch.Tensor:
+    """Decode to flat original bytes on the stream's device.
+
+    A contiguous uint8 ``out`` can be supplied as reusable scratch; its unused suffix is left
+    unchanged. CUDA uses the optional GPU extension when available. Without that extension,
+    decoding falls back to CPU and copies the result back to the input device.
+    """
+    device = parts["stream"].device
+    has_raw = "raw" in parts
+    nbytes = n_symbols * (2 if has_raw else 1)
+    if out is not None and (out.dtype != torch.uint8 or out.device != device or
+                            not out.is_contiguous() or out.numel() < nbytes):
+        raise ValueError("out must be a contiguous uint8 buffer on the stream device with enough bytes")
+    if device.type == "cuda":
+        from ..kernels.cuda import ext as cuda_ext
+
+        e_cuda = cuda_ext()
+        if e_cuda is not None:
+            result = out.view(-1)[:nbytes] if out is not None else torch.empty(nbytes, device=device, dtype=torch.uint8)
+            lut = decode_table(parts["lens"].cpu(), maxlen).to(device)
+            raw = parts["raw"].to(device).contiguous() if has_raw else torch.empty(0, device=device, dtype=torch.uint8)
+            e_cuda.huff_decode_into(parts["stream"].contiguous(), parts["offsets"].to(device).contiguous(),
+                                   n_symbols, block, lut, maxlen, raw, result)
+            return result
     e = ext()
     if e is None:
         raise RuntimeError("Mode B decoding needs the C++ extension")
-    lut = decode_table(parts["lens"], maxlen)
-    sym = e.huff_decode(parts["stream"], parts["offsets"], n_symbols, block, lut, maxlen)
-    return join_bytes(sym, parts.get("raw"))
+    cpu_parts = {k: v.cpu().contiguous() for k, v in parts.items()}
+    lut = decode_table(cpu_parts["lens"], maxlen)
+    sym = e.huff_decode(cpu_parts["stream"], cpu_parts["offsets"], n_symbols, block, lut, maxlen)
+    result = join_bytes(sym, cpu_parts.get("raw")).to(device)
+    if out is not None:
+        out.view(-1)[:nbytes].copy_(result)
+        return out.view(-1)[:nbytes]
+    return result
 
 
 def coded_bytes(parts: dict[str, torch.Tensor]) -> int:
