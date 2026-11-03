@@ -1,11 +1,10 @@
 # Boilerplate
 
-A ternary-first inference engine for MoE transformer LLMs, plus a pipeline that turns
-`deepseek-ai/DeepSeek-V4.1-Flash-1017` into a real ternary (~1.6–2 bits/weight) model.
+An inference engine for MoE transformer LLMs, being built toward a **goal** that is not yet
+reached: turning `deepseek-ai/DeepSeek-V4.1-Flash-1017` into a ternary model whose routed experts
+use ~1.6–2 bits/weight.
 
-Weight modes: **A** baseline (original FP8/FP4), **B** lossless entropy-coded, **C** stacked
-residual ternary (k = 1–4 terms), **D** QAT-trained single ternary. Packing: TQ2 (2 bits/weight)
-and TQ1 (5 trits/byte, 1.6 bits/weight).
+## What works today
 
 Status: **M0** (skeleton, config parser, reference harness), **M1** (Mode A engine, bit-exact
 with the official reference), **M2** (TQ1/TQ2 packing, CPU ternary kernel, Mode C with optional
@@ -13,6 +12,31 @@ GPTQ) and **M3** (Mode B, bit-exact with Mode A, on CPU) are done. See `docs/rep
 `docs/architecture/format.md` for the on-disk format,
 `docs/architecture/deepseek_v41_flash.md` for what the checkpoint contains and
 `docs/architecture/engine.md` for the engine design.
+* **Mode A only.** The engine runs the checkpoint in its shipped formats (FP8 linears, FP4 routed
+  experts, BF16/FP32 small tensors). Its kernels (`boilerplate/kernels/torch_ref.py`) are a
+  correctness backend: they dequantize each weight and run a floating-point GEMM. They are slow
+  (0.067 tok/s decode on a 7-layer real-weight slice on 4 CPU cores).
+* Mode A matches the official DeepSeek reference **bit for bit**, with both running on the same
+  PyTorch kernels, on a tiny random-init model and on a 7-of-40-layer, 16-of-384-expert slice of
+  the real weights without engram. That validates the engine around the kernels, not the full
+  model's quality. See `docs/reports/M1.md` for the exact scope.
+* No ternary code exists yet: TQ1/TQ2 packing, ternary kernels, Mode C, Mode B and QAT are planned.
+
+## Planned weight modes
+
+**A** baseline (original FP8/FP4), **B** lossless entropy-coded, **C** stacked residual ternary,
+**D** QAT-trained single ternary. Packing: TQ2 (2 bits/weight) and TQ1 (5 trits/byte, 1.6
+bits/weight), each plus an FP16 scale per 128 weights (1.725 / 2.125 bits/weight).
+
+What ternary can save here is limited by the source: the routed experts are already FP4 (4.25
+bits/weight) and ~40% of the file is FP8 engram tables. Ternary experts take the checkpoint from
+~510 GB to ~334 GB (≈1.5×), and stacking two or more ternary terms on the experts saves little or
+nothing over FP4. See `docs/architecture/bit_accounting.md`. Ternary weights alone are not new
+(BitNet b1.58, llama.cpp `TQ1_0`/`TQ2_0`); the next experiment, a real ternary checkpoint of a
+complete small model against conventional quants, is planned in `docs/plans/small_model_ternary.md`.
+
+Milestone reports are in `docs/reports/`; `docs/architecture/deepseek_v41_flash.md` describes
+what the checkpoint contains and `docs/architecture/engine.md` the engine design.
 
 ## Quick start
 
