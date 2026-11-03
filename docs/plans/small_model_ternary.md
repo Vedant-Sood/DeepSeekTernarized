@@ -1,6 +1,6 @@
 # Plan: a real ternary checkpoint of a complete small model
 
-Status: proposed 2026-11-03. Not started. It needs a GPU budget decision before the training phase.
+Status: approved 2026-11-03 to run after M2 and before M3 (Vedant). Not started. The training phase needs a GPU budget decision.
 
 ## Why
 
@@ -10,7 +10,7 @@ end to end on a complete pretrained model small enough to train on rented hardwa
 work goes into the 760 B-parameter target. It replaces the old M4 ("QAT validated on a small model")
 and adds a conventional quantized baseline and a published size/quality/speed comparison.
 
-Recommended placement: directly after M2 (it needs TQ1/TQ2 packing and the ternary kernels),
+Placement (decided 2026-11-03): directly after M2 (it needs TQ1/TQ2 packing and the ternary kernels),
 before M3 (lossless Mode B, which `deepseek_v41_flash.md` expects to give small gains on FP4/FP8).
 
 ## Models
