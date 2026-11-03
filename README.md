@@ -6,6 +6,12 @@ use ~1.6–2 bits/weight.
 
 ## What works today
 
+Status: **M0** (skeleton, config parser, reference harness), **M1** (Mode A engine, bit-exact
+with the official reference), **M2** (TQ1/TQ2 packing, CPU ternary kernel, Mode C with optional
+GPTQ) and **M3** (Mode B, bit-exact with Mode A, on CPU) are done. See `docs/reports/`,
+`docs/architecture/format.md` for the on-disk format,
+`docs/architecture/deepseek_v41_flash.md` for what the checkpoint contains and
+`docs/architecture/engine.md` for the engine design.
 * **Mode A only.** The engine runs the checkpoint in its shipped formats (FP8 linears, FP4 routed
   experts, BF16/FP32 small tensors). Its kernels (`boilerplate/kernels/torch_ref.py`) are a
   correctness backend: they dequantize each weight and run a floating-point GEMM. They are slow
@@ -54,6 +60,12 @@ boilerplate compare traces/tiny_ref traces/tiny_modeA --min-cos 0.9999
 # A 7-layer, 16-expert slice of the real trained weights (~6 GB by HTTP range requests)
 boilerplate make-truncated deepseek-ai/DeepSeek-V4.1-Flash-1017 ./trunc7
 
+# Export under a precision policy: Mode C (ternary experts), Mode B (lossless), mixed
+boilerplate export ./trunc7 ./trunc7_k2 --policy configs/policy/experts_k2.yaml
+boilerplate export ./trunc7 ./trunc7_lossless --policy configs/policy/lossless.yaml
+# GPTQ rules (gptq: true) need calibration text
+boilerplate export ./trunc7 ./trunc7_gptq --policy my_gptq.yaml --calib-text wiki_train.txt --calib-seqs 512
+
 # Generate
 boilerplate generate ./trunc7 "The capital of France is" --max-new-tokens 16
 ```
@@ -72,12 +84,14 @@ eng.generate([[0, 17, 42]], max_new_tokens=8, temperature=0).tokens
 boilerplate/
   checkpoint/   config/index/header reading, FP8/FP4 block formats
   config/       ModelSpec derivation, tensor roles, size report
-  engine/       Mode A engine: config, mmap weights, model, paged KV cache, engram, API
-  kernels/      kernel backends (torch_ref: the official kernels' numerics in PyTorch)
+  engine/       engine: config, mmap weights (Modes A/B/C), model, paged KV cache, engram, API
+  format/       precision policies, export + manifest, Mode B entropy codec, GPTQ calibration
+  kernels/      torch_ref (official kernels' numerics) and the C++ CPU extension (ternary GEMM, Huffman)
+  ternary/      TQ1/TQ2 packing, stacked-ternary and GPTQ fitting, ternary linear
   reference/    traces, comparison, official + HF backends
   testing/      tiny checkpoint writer, truncated real-checkpoint slicer
 third_party/    official DeepSeek V4.1 inference code (MIT), the trusted reference
-configs/        source checkpoint id
+configs/        source checkpoint id, precision policies (configs/policy/)
 docs/           architecture notes and milestone reports
 tests/
 ```

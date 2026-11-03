@@ -1,0 +1,12 @@
+# Size-first Mode C: one ternary term per routed-expert weight, TQ1: 1.725 bits/weight (0.41x of FP4).
+# Quality needs QAT (Mode D) at this setting; as post-training quantization it is a lower bound.
+name: experts-k1
+default: {mode: A}
+rules:
+  - match: '^layers\.\d+\.ffn\.experts\.\d+\.w[123]$'
+    mode: C
+    k: 1
+    group: 128
+    packing: tq1
+    scale_dtype: fp16
+    act: int8

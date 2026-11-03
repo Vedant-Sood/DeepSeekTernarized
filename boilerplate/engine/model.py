@@ -27,12 +27,18 @@ from .config import EngineConfig
 from .engram import EngramHasher, EngramLayout
 from .kv_cache import KVCache, Sequence
 from .weights import WeightStore
+from ..ternary.ops import PackedTerm, TernaryLinear
+from ..ternary.pack import unpack
 
 ACT_DTYPE = torch.bfloat16
 SCALE_DTYPE = torch.float8_e8m0fnu
 
 
 # ---------------------------------------------------------------------------------------- linears
+
+
+# Calibration capture for GPTQ: {weight base name: [X^T X accumulator, token count]}; None = off.
+CALIB: dict | None = None
 
 
 class DequantCache:
@@ -98,7 +104,13 @@ class QLinear:
             make = lambda: K.dequant_fp4_weight(self.weight, self.scale)  # noqa: E731
         return QLinear.cache.get(self, make) if QLinear.cache is not None else make()
 
+    name: str = ""
+
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if CALIB is not None and self.name in CALIB:
+            xf = x.reshape(-1, x.size(-1)).float()
+            CALIB[self.name][0].addmm_(xf.t(), xf)
+            CALIB[self.name][1] += xf.size(0)
         if self.kind == "dense":
             return F.linear(x, self.weight)
         q, s = K.act_quant(x, self.act_block, "ue8m0", SCALE_DTYPE)
@@ -198,6 +210,7 @@ class _NS:
 class V4Model:
     def __init__(self, cfg: EngineConfig, weights: WeightStore, tokenizer=None, max_seq_len: int = 4096, dequant_cache_bytes: int = 2 << 30):
         self.cfg = cfg
+        self.ternary_backend = "auto"
         QLinear.cache = DequantCache(dequant_cache_bytes) if dequant_cache_bytes else None
         self.w = weights
         self.max_seq_len = max_seq_len
@@ -219,9 +232,7 @@ class V4Model:
             cfg.rope_head_dim, max_seq_len, cfg.original_seq_len, cfg.compress_rope_theta, cfg.rope_factor, cfg.beta_fast, cfg.beta_slow
         )
 
-        def lin(name):
-            scale = W.maybe(f"{name}.scale")
-            return QLinear(g(f"{name}.weight"), scale, blk)
+        lin = self.linear
 
         for i in range(cfg.n_layers):
             p = f"layers.{i}"
@@ -273,7 +284,13 @@ class V4Model:
                 e = f"{p}.engram"
                 E = _NS()
                 E.index = self.engram_layout.layer_ids.index(i)
-                E.table, E.table_scale = g(f"{e}.embed.weight"), g(f"{e}.embed.scale")
+                tm = W.mode_of(f"{e}.embed")
+                if tm["mode"] == "C":  # ternary lookup table: rows are dequantized on lookup
+                    E.table = None
+                    E.tq = [(g(f"{e}.embed.tq{i}.packed"), g(f"{e}.embed.tq{i}.scale")) for i in range(tm["terms"])]
+                    E.tq_fmt, E.tq_group, E.tq_K = tm["packing"], tm["group"], tm["shape"][1]
+                else:
+                    E.table, E.table_scale = g(f"{e}.embed.weight"), g(f"{e}.embed.scale")
                 E.wkv = lin(f"{e}.wkv")
                 E.weight = g(f"{e}.q_weight").bfloat16().float() * g(f"{e}.k_weight").bfloat16().float()
                 L.engram = E
@@ -284,12 +301,21 @@ class V4Model:
 
     # ---------------------------------------------------------------------------------- pieces
 
+    def linear(self, base: str):
+        """The linear for a weight base name, in whatever mode the checkpoint stores it."""
+        m = self.w.mode_of(base)
+        if m["mode"] == "C":
+            terms = [PackedTerm(self.w.get(f"{base}.tq{i}.packed"), self.w.get(f"{base}.tq{i}.scale")) for i in range(m["terms"])]
+            lin = TernaryLinear(terms, m["shape"][1], m["packing"], m["group"], act=m.get("act", "int8"), backend=self.ternary_backend)
+        else:  # A, or B (WeightStore decodes B back to the original bytes)
+            lin = QLinear(self.w.get(f"{base}.weight"), self.w.maybe(f"{base}.scale"), self.cfg.fp8_block)
+        lin.name = base
+        return lin
+
     def expert(self, L, e: int):
         if L.experts[e] is None:
             pre = f"{L.expert_prefix}.{e}"
-            L.experts[e] = tuple(
-                QLinear(self.w.get(f"{pre}.{w}.weight"), self.w.get(f"{pre}.{w}.scale"), self.cfg.fp8_block) for w in ("w1", "w2", "w3")
-            )
+            L.experts[e] = tuple(self.linear(f"{pre}.{w}") for w in ("w1", "w2", "w3"))
         return L.experts[e]
 
     def swiglu(self, ws, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
@@ -356,10 +382,18 @@ class V4Model:
         """h: [1, T, hc, dim]; hash_ids: [1, T, n_cols] (reference Engram + ParallelEngramEmbedding)."""
         dim, hc = self.cfg.dim, self.cfg.hc_mult
         flat = hash_ids.reshape(-1)
-        rows = E.table.index_select(0, flat).float()
-        scales = E.table_scale.index_select(0, flat).float()
-        blk = rows.size(-1) // scales.size(-1)
-        vals = (rows.unflatten(-1, (-1, blk)) * scales.unsqueeze(-1)).flatten(-2).to(torch.bfloat16)
+        if E.table is not None:
+            rows = E.table.index_select(0, flat).float()
+            scales = E.table_scale.index_select(0, flat).float()
+            blk = rows.size(-1) // scales.size(-1)
+            vals = (rows.unflatten(-1, (-1, blk)) * scales.unsqueeze(-1)).flatten(-2).to(torch.bfloat16)
+        else:
+            vals = None
+            for packed, sc in E.tq:
+                t = unpack(packed.index_select(0, flat), E.tq_fmt, E.tq_K).float()
+                v = t * sc.index_select(0, flat).float().repeat_interleave(E.tq_group, -1)[:, : E.tq_K]
+                vals = v if vals is None else vals + v
+            vals = vals.to(torch.bfloat16)
         vals = vals.view(*hash_ids.shape, -1)
         kv = E.wkv(vals.flatten(-2))
         key, value = kv.split([hc * dim, dim], dim=-1)

@@ -1,0 +1,4 @@
+# Mode B everywhere it applies: every 1- and 2-byte weight tensor entropy-coded, bit-identical outputs.
+name: lossless
+default: {mode: B}
+rules: []
