@@ -131,6 +131,45 @@ def _cmd_generate(a) -> int:
     return 0
 
 
+def _cmd_bench(a) -> int:
+    """Prefill and decode throughput of the engine, with peak resident memory."""
+    import resource
+    import time
+
+    from .engine import Engine
+
+    torch.manual_seed(a.seed)
+    t0 = time.perf_counter()
+    eng = Engine.load(a.checkpoint, max_seq_len=a.prompt_len + a.gen_len + 1, max_seqs=a.batch, max_tokens=a.batch * (a.prompt_len + a.gen_len + 64))
+    t_load = time.perf_counter() - t0
+    cache = eng.new_cache()
+    seqs = [cache.new_sequence() for _ in range(a.batch)]
+    prompts = torch.randint(0, eng.cfg.vocab_size, (a.batch, a.prompt_len)).tolist()
+    t0 = time.perf_counter()
+    logits = eng.model.forward(list(zip(seqs, prompts)), cache)
+    t_pre = time.perf_counter() - t0
+    nxt = logits.argmax(-1).tolist()
+    t0 = time.perf_counter()
+    for _ in range(a.gen_len):
+        nxt = eng.model.forward([(q, [t]) for q, t in zip(seqs, nxt)], cache).argmax(-1).tolist()
+    t_dec = time.perf_counter() - t0
+    res = {
+        "checkpoint": a.checkpoint,
+        "batch": a.batch,
+        "prompt_len": a.prompt_len,
+        "gen_len": a.gen_len,
+        "threads": torch.get_num_threads(),
+        "load_s": round(t_load, 3),
+        "prefill_tok_s": round(a.batch * a.prompt_len / t_pre, 2),
+        "decode_tok_s": round(a.batch * a.gen_len / t_dec, 3) if a.gen_len else None,
+        "peak_rss_gb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6, 2),
+        "kv_pages_in_use": cache.pages_in_use,
+        "kernel_backend": "torch_ref",
+    }
+    print(json.dumps(res, indent=2))
+    return 0
+
+
 def _cmd_compare(a) -> int:
     from .reference import ReferenceTrace, compare_traces
 
@@ -198,6 +237,14 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--seed", type=int)
     s.add_argument("--max-seq-len", type=int, default=4096)
     s.set_defaults(fn=_cmd_generate)
+
+    s = sub.add_parser("bench", help="measure engine prefill/decode throughput and peak memory")
+    s.add_argument("checkpoint")
+    s.add_argument("--prompt-len", type=int, default=128)
+    s.add_argument("--gen-len", type=int, default=16)
+    s.add_argument("--batch", type=int, default=1)
+    s.add_argument("--seed", type=int, default=0)
+    s.set_defaults(fn=_cmd_bench)
 
     s = sub.add_parser("compare", help="compare two traces layer by layer")
     s.add_argument("reference")
