@@ -16,9 +16,10 @@ source checkpoint, so every tensor is Mode A).
 
 ## Policy
 
-A YAML list of rules, tried in order. The first rule whose regex `search`es a weight's base name
-(the tensor name without `.weight`) decides how that weight is stored. Tensors that are not weights
-(norms, biases, hyper-connection parameters, attention sinks) are always Mode A.
+A YAML list of rules, tried in order. For a weight, the first rule whose regex `search`es its base
+name (the tensor name without `.weight`) decides how that weight and its scale are stored. For
+other tensors, rules match the full tensor name. Mode B codes supported one- and two-byte tensors;
+wider tensors remain unchanged. Mode C applies only to eligible two-dimensional weights.
 
 ```yaml
 name: experts-k2
@@ -48,8 +49,8 @@ Shipped policies (`configs/policy/`):
 | `experts_k2.yaml` | routed experts, TQ1 k=2 | 3.45 |
 | `experts_k1.yaml` | routed experts, TQ1 k=1 | 1.725 |
 | `experts_engram_k2.yaml` | routed experts and both engram tables, TQ1 k=2 | 3.45 |
-| `lossless.yaml` | every weight Mode B | n/a |
-| `experts_k2_lossless_rest.yaml` | routed experts Mode C; other supported weights Mode B | 3.45 for experts |
+| `lossless.yaml` | supported tensors Mode B; wider tensors unchanged | n/a |
+| `experts_k2_lossless_rest.yaml` | routed experts Mode C; other supported tensors Mode B | 3.45 for experts |
 
 ## Stored tensors per mode
 

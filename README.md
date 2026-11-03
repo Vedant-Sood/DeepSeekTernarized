@@ -23,7 +23,7 @@ GPU engine integration and the real-slice memory acceptance check remain open. S
   PyTorch kernels, on a tiny random-init model and on a 7-of-40-layer, 16-of-384-expert slice of
   the real weights without engram. That validates the engine around the kernels, not the full
   model's quality. See `docs/reports/M1.md` for the exact scope.
-* **Mode B** losslessly encodes supported weights on disk and decodes them to the original bytes.
+* **Mode B** losslessly encodes supported tensors on disk and decodes them to the original bytes.
   Decoded tensors and table blocks use an LRU with a configurable byte budget; transient decoding
   and process RSS are not limited by that budget.
 * **Mode C** exports and runs stacked ternary weights with TQ1/TQ2 packing, CPU kernels and
