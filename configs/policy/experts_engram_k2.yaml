@@ -1,0 +1,18 @@
+# As experts_k2, and also ternarize the engram n-gram lookup tables (~40% of V4.1 Flash's bytes).
+name: experts-engram-k2
+default: {mode: A}
+rules:
+  - match: '^layers\.\d+\.ffn\.experts\.\d+\.w[123]$'
+    mode: C
+    k: 2
+    group: 128
+    packing: tq1
+    scale_dtype: fp16
+    act: int8
+    gptq: false
+  - match: '^layers\.\d+\.engram\.embed$'
+    mode: C
+    k: 2
+    group: 128
+    packing: tq1
+    scale_dtype: fp16

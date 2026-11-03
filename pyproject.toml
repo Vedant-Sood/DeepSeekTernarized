@@ -20,6 +20,8 @@ dependencies = [
 [project.optional-dependencies]
 hf = ["transformers>=4.50", "huggingface_hub>=0.25"]
 dev = ["pytest>=8"]
+# JIT build of the C++ CPU kernels (boilerplate/kernels/csrc); without it the PyTorch fallbacks run
+cpp = ["ninja"]
 # the vendored official reference imports these at module load; tokenizers also feeds engram hashing
 reference = ["sympy", "Pillow", "tokenizers>=0.20", "transformers>=4.50"]
 
@@ -28,6 +30,9 @@ boilerplate = "boilerplate.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["boilerplate*"]
+
+[tool.setuptools.package-data]
+boilerplate = ["kernels/csrc/*.cpp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

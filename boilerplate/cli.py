@@ -178,6 +178,33 @@ def _cmd_compare(a) -> int:
     return 0 if cmp.min_cos >= a.min_cos else 1
 
 
+def _cmd_export(a) -> int:
+    from .format.export import export
+    from .format.policy import Policy
+
+    pol = Policy.load(a.policy)
+    hessians = None
+    if any(r.gptq for r in pol.rules):
+        from .engine import Engine
+        from .format.calibrate import calibrate
+
+        if not a.calib_text:
+            raise SystemExit("the policy asks for GPTQ: pass --calib-text (a UTF-8 text file)")
+        eng = Engine.load(a.source, max_seq_len=a.calib_len + 8)
+        if eng.tokenizer is None:
+            raise SystemExit("no tokenizer.json next to the checkpoint")
+        toks = eng.tokenizer.encode(open(a.calib_text, encoding="utf-8").read()).ids
+        seqs = [toks[i : i + a.calib_len] for i in range(0, len(toks) - a.calib_len + 1, a.calib_len)][: a.calib_seqs]
+        if not seqs:
+            raise SystemExit(f"calibration text is shorter than --calib-len {a.calib_len} tokens")
+        layers = {int(x) for x in a.calib_layers.split(",")} if a.calib_layers else None
+        hessians = calibrate(eng, seqs, pol, layers)
+    out = export(a.source, a.out_dir, pol, hessians=hessians, shard_bytes=int(a.shard_gb * 2**30))
+    s = json.loads((out / "manifest.json").read_text())["summary"]
+    print(json.dumps(s, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="boilerplate")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -251,6 +278,17 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("candidate")
     s.add_argument("--min-cos", type=float, default=0.99)
     s.set_defaults(fn=_cmd_compare)
+
+    s = sub.add_parser("export", help="write a Boilerplate-format checkpoint under a precision policy (Modes A/B/C)")
+    s.add_argument("source")
+    s.add_argument("out_dir")
+    s.add_argument("--policy", required=True, help="YAML policy (see configs/policy/)")
+    s.add_argument("--shard-gb", type=float, default=2.0)
+    s.add_argument("--calib-text", help="GPTQ: text file to calibrate on")
+    s.add_argument("--calib-seqs", type=int, default=512, help="GPTQ: number of calibration sequences")
+    s.add_argument("--calib-len", type=int, default=512, help="GPTQ: tokens per calibration sequence")
+    s.add_argument("--calib-layers", help="GPTQ: only calibrate these layer ids (comma-separated)")
+    s.set_defaults(fn=_cmd_export)
 
     a = p.parse_args(argv)
     return a.fn(a)

@@ -1,0 +1,16 @@
+# Default Mode C policy: ternarize routed-expert FFN weights (the bulk of the parameters), keep
+# everything else in the checkpoint's own format. V4.1's experts are already FP4 (4.25 bits/weight
+# with scales), so only settings well below that are allowed: TQ1 k=2 is 2 x (1.6 + 16/128) = 3.45
+# b/w (0.81x); TQ2 k=2 would be 4.25 (no saving) and is refused unless allow_larger is set. Rules are tried in order; the first whose regex
+# matches a weight's base name (the tensor name without ".weight") applies.
+name: experts-k2
+default: {mode: A}
+rules:
+  - match: '^layers\.\d+\.ffn\.experts\.\d+\.w[123]$'
+    mode: C
+    k: 2            # ternary terms per weight (1-4)
+    group: 128      # input columns per scale
+    packing: tq1    # tq1 (1.6 bits/weight) or tq2 (2 bits/weight, faster to unpack)
+    scale_dtype: fp16
+    act: int8       # activation quantization into the ternary layer: int8 (per-token absmax) or bf16
+    gptq: false     # GPTQ-style error compensation from calibration inputs

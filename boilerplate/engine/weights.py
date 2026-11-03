@@ -33,6 +33,10 @@ ST_DTYPES = {
 }
 
 
+ST_TORCH = {str(v).replace("torch.", ""): v for v in ST_DTYPES.values()}
+ST_TORCH["float4_e2m1fn_x2"] = torch.float4_e2m1fn_x2
+
+
 class _Shard:
     def __init__(self, path: Path):
         self.path = path
@@ -79,18 +83,44 @@ class WeightStore:
         for s in self.shards:
             for n in s.meta:
                 self.where[n] = s
+        # Boilerplate-format directories carry a manifest: per weight base name its mode
+        # (A original, B entropy-coded, C stacked ternary) and how it is stored
+        mpath = self.root / "manifest.json"
+        self.manifest: dict | None = json.loads(mpath.read_text()) if mpath.exists() else None
+        self.coded: dict[str, dict] = {}  # Mode B: original tensor name -> coding info
+        if self.manifest:
+            for meta in self.manifest["tensors"].values():
+                if meta["mode"] == "B":
+                    self.coded.update(meta["coded"])
+                    self._mode_b = (meta["maxlen"], meta["block"])
+
+    def mode_of(self, base: str) -> dict:
+        """Manifest entry of a weight base name ({"mode": "A"} for plain checkpoints)."""
+        if self.manifest is None:
+            return {"mode": "A"}
+        return self.manifest["tensors"].get(base, {"mode": "A"})
 
     def __contains__(self, name: str) -> bool:
-        return name in self.where
+        return name in self.where or name in self.coded
 
     def names(self) -> list[str]:
         return list(self.where)
 
     def get(self, name: str) -> torch.Tensor:
+        if name in self.coded:  # Mode B: decode back to the exact original bytes
+            from ..format import entropy
+
+            info = self.coded[name]
+            parts = {k: self.where[f"{name}.h{k}"].get(f"{name}.h{k}") for k in ("stream", "offsets", "lens")}
+            if f"{name}.hraw" in self.where:
+                parts["raw"] = self.get(f"{name}.hraw")
+            maxlen, block = self._mode_b
+            raw = entropy.decode(parts, info["symbols"], maxlen, block)
+            return raw.view(ST_TORCH[info["dtype"]]).view(info["shape"])
         try:
             return self.where[name].get(name)
         except KeyError:
             raise KeyError(f"tensor {name!r} not in checkpoint {self.root}") from None
 
     def maybe(self, name: str) -> torch.Tensor | None:
-        return self.get(name) if name in self.where else None
+        return self.get(name) if name in self else None
