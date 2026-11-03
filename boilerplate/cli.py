@@ -9,6 +9,15 @@ import sys
 import torch
 
 
+def _rss_bytes(ru_maxrss: int, platform: str) -> int:
+    """Convert getrusage's peak RSS to bytes on supported platforms."""
+    if platform.startswith("linux"):
+        return ru_maxrss * 1024  # KiB on Linux
+    if platform == "darwin":
+        return ru_maxrss  # bytes on macOS
+    raise ValueError(f"unsupported ru_maxrss units on platform {platform!r}")
+
+
 def _cmd_inspect(a) -> int:
     from .checkpoint import CheckpointSource
     from .config import parse_checkpoint
@@ -157,6 +166,7 @@ def _cmd_bench(a) -> int:
     for _ in range(a.gen_len):
         nxt = eng.model.forward([(q, [t]) for q, t in zip(seqs, nxt)], cache).argmax(-1).tolist()
     t_dec = time.perf_counter() - t0
+    peak_rss_bytes = _rss_bytes(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, sys.platform)
     res = {
         "checkpoint": a.checkpoint,
         "batch": a.batch,
@@ -168,7 +178,8 @@ def _cmd_bench(a) -> int:
         "load_s": round(t_load, 3),
         "prefill_tok_s": round(a.batch * a.prompt_len / t_pre, 2),
         "decode_tok_s": round(a.batch * a.gen_len / t_dec, 3) if a.gen_len else None,
-        "peak_rss_gb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6, 2),
+        "peak_rss_bytes": peak_rss_bytes,
+        "peak_rss_gib": round(peak_rss_bytes / (1 << 30), 4),
         "kv_pages_in_use": cache.pages_in_use,
         "kernel_backend": "torch_ref",
         "mode_b_cache_budget_bytes": eng.model.w.mode_b_cache_bytes,
