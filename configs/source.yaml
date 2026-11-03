@@ -1,0 +1,10 @@
+# Source checkpoint for the ternarization pipeline.
+# Everything about the architecture is derived from this checkpoint's config.json,
+# model.safetensors.index.json and safetensors headers; nothing below describes the shape.
+source:
+  # Hugging Face repo id, or a local directory containing config.json + *.safetensors.
+  model_id: deepseek-ai/DeepSeek-V4.1-Flash-1017
+  revision: main
+  # The official reference implementation ships inside the checkpoint repo under inference/.
+  # Download it with:  huggingface-cli download <model_id> --include "inference/*" --local-dir <dir>
+  reference_code_subdir: inference
