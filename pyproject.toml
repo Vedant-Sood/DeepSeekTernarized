@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "boilerplate"
-version = "0.0.1"
+version = "0.1.0"
 description = "Ternary-first inference engine for MoE LLMs, plus a ternarization pipeline for DeepSeek V4.1 Flash"
 readme = "README.md"
 license = { text = "MIT" }
