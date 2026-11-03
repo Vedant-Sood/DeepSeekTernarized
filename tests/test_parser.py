@@ -27,17 +27,18 @@ def test_tiny_spec_matches_config(tiny_dir):
     att = spec.attention
     assert att.type == "deepseek_v4_sparse" and att.attn_sink
     assert [l.compress_ratio for l in att.layers] == t["compress_ratios"]
-    assert [l.kv_source_layer for l in att.layers] == [None, 1, 1, 3, 3, None]
-    assert [l.rope for l in att.layers] == ["main", "compress", "compress", "compress", "compress", "main"]
+    assert [l.kv_source_layer for l in att.layers] == [None, None, 2, 2, 4, 4, 4, 4]
+    assert [l.index_source_layer for l in att.layers] == [None, None, 2, 2, 4, 4, 6, 6]
+    assert [l.rope for l in att.layers] == ["main"] * 2 + ["compress"] * 6
     assert spec.rope.scaling_type is None and spec.rope.theta == t["rope_theta"]
     assert spec.rope_compress.scaling_type == "yarn" and spec.rope_compress.theta == t["compress_rope_theta"]
     moe = spec.moe
     assert (moe.n_routed_experts, moe.n_shared_experts, moe.top_k) == (8, 1, 2)
     assert moe.router_bias and not moe.router_bias_vl
-    assert moe.moe_layers == list(range(6)) and moe.dense_layers == []
+    assert moe.moe_layers == list(range(8)) and moe.dense_layers == []
     st = spec.storage
     assert st.verified_from_headers
-    assert st.role_formats["routed_expert"] == {"fp4_e2m1/group32/F8_E8M0": 8 * 3 * 6}
+    assert st.role_formats["routed_expert"] == {"fp4_e2m1/group32/F8_E8M0": 8 * 3 * 8}
     assert set(st.role_formats["attention"]) == {"fp8_e4m3/block32x32/F8_E8M0"}
     assert set(st.role_formats["embedding"]) == {"bf16"}
     assert spec.hyper_connections["hc_mult"] == 4
@@ -55,7 +56,7 @@ def test_size_breakdown_counts_fp4_unpacked(tiny_dir):
 def test_no_headers_falls_back_to_declared(tiny_dir):
     spec = parse_checkpoint(CheckpointSource.open(tiny_dir, read_headers=False))
     assert not spec.storage.verified_from_headers
-    assert spec.storage.role_formats["routed_expert"] == {"fp4(declared)": 144}
+    assert spec.storage.role_formats["routed_expert"] == {"fp4(declared)": 8 * 8 * 3}
     assert any("headers not read" in w for w in spec.warnings)
 
 
@@ -63,10 +64,10 @@ def test_index_inconsistencies_become_warnings(tmp_path):
     root = write_tiny_checkpoint(tmp_path / "c", config=tiny_config(n_routed_experts=8))
     index_path = root / "model.safetensors.index.json"
     index = json.loads(index_path.read_text())
-    # drop expert 7 of layer 2 and the compressor of layer 3
+    # drop expert 7 of layer 2 and the compressor of layer 4
     index["weight_map"] = {
         k: v for k, v in index["weight_map"].items()
-        if not k.startswith("layers.2.ffn.experts.7.") and not k.startswith("layers.3.attn.compressor.")
+        if not k.startswith("layers.2.ffn.experts.7.") and not k.startswith("layers.4.attn.compressor.")
     }
     index_path.write_text(json.dumps(index))
     src = CheckpointSource.open(root)
@@ -74,7 +75,7 @@ def test_index_inconsistencies_become_warnings(tmp_path):
     spec = parse_checkpoint(src)
     text = "\n".join(spec.warnings)
     assert "{2: 7}" in text
-    assert "kv_source_layer_ids [1, 3] != layers with compressor tensors [1]" in text
+    assert "kv_source_layer_ids [2, 4] != layers with compressor tensors [2]" in text
 
 
 def test_real_v41_config_structure():

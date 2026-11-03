@@ -116,6 +116,17 @@ def _isolated_import(code_dir: Path, use_cpu_kernels: bool):
         sys.modules.update(saved)
 
 
+def load_hf_tokenizer(path: str | Path):
+    """The transformers fast tokenizer the reference expects (it reads ``backend_tokenizer``), or
+    None when the directory has no tokenizer.json."""
+    p = Path(path) / "tokenizer.json"
+    if not p.exists():
+        return None
+    from transformers import PreTrainedTokenizerFast
+
+    return PreTrainedTokenizerFast(tokenizer_file=str(p))
+
+
 def convert_checkpoint(code_dir: Path, hf_ckpt: Path, out_dir: Path, expert_dtype: str | None) -> Path:
     """Run the reference convert.py with model-parallel 1; returns the converted shard path."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -151,7 +162,10 @@ class OfficialReference:
         self.work_dir = Path(work_dir)
         self.tokenizer = tokenizer
 
-    def trace(self, input_ids: torch.Tensor) -> ReferenceTrace:
+    def trace(self, input_ids: torch.Tensor, decode_from: int | None = None) -> ReferenceTrace:
+        """One forward over ``input_ids``, or with ``decode_from=k`` a prefill of the first k tokens
+        followed by one decode step per remaining token (the reference's generate loop). Hidden
+        states and logits are concatenated over the steps."""
         from safetensors.torch import load_file
 
         ckpt = convert_checkpoint(self.code_dir, self.hf_ckpt, self.work_dir, self.args_kwargs.get("expert_dtype"))
@@ -170,16 +184,23 @@ class OfficialReference:
                 if missing or unexpected:
                     raise RuntimeError(f"checkpoint/model mismatch: missing={missing[:10]} unexpected={unexpected[:10]}")
                 model.eval()
-                hidden: list[torch.Tensor] = []
-                hooks = [blk.register_forward_hook(lambda _m, _i, out: hidden.append(out[0].detach().clone())) for blk in model.layers]
+                steps: list[list[torch.Tensor]] = []
+                hooks = [blk.register_forward_hook(lambda _m, _i, out: steps[-1].append(out[0].detach().clone())) for blk in model.layers]
                 # full-sequence logits instead of last-position only
                 hooks.append(model.head.register_forward_pre_hook(lambda _m, a, kw: (a, {**kw, "full_logits": True}), with_kwargs=True))
+                k = input_ids.size(1) if decode_from is None else decode_from
+                calls = [(input_ids[:, :k], 0)] + [(input_ids[:, t : t + 1], t) for t in range(k, input_ids.size(1))]
+                all_logits = []
                 try:
-                    out = model(input_ids)
+                    for ids, start in calls:
+                        steps.append([])
+                        out = model(ids, start)
+                        all_logits.append(out[1] if isinstance(out, tuple) else out)
                 finally:
                     for h in hooks:
                         h.remove()
-                logits = out[1] if isinstance(out, tuple) else out
+                hidden = [torch.cat([st[i] for st in steps], 1) for i in range(len(steps[0]))]
+                logits = torch.cat([lg.view(input_ids.size(0), -1, lg.size(-1)) for lg in all_logits], 1)
         finally:
             torch.set_default_dtype(prev_dtype)
         return ReferenceTrace(
@@ -193,5 +214,6 @@ class OfficialReference:
                 "cpu_kernels": self.use_cpu_kernels,
                 "hidden_semantics": "output of each Block: full hyper-connection stream [b, s, hc_mult, dim]",
                 "ignored_config_keys": unknown,
+                "decode_from": decode_from,
             },
         )

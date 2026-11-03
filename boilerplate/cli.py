@@ -57,6 +57,14 @@ def _cmd_make_tiny(a) -> int:
     return 0
 
 
+def _cmd_make_truncated(a) -> int:
+    from .testing.truncate import make_truncated
+
+    layers = [int(x) for x in a.layers.split(",")]
+    print(make_truncated(a.source, a.out_dir, layers, a.experts, keep_engram=a.keep_engram, revision=a.revision))
+    return 0
+
+
 def _input_ids(a, vocab: int) -> torch.Tensor:
     g = torch.Generator().manual_seed(a.seed)
     return torch.randint(0, vocab, (a.batch, a.seq_len), generator=g)
@@ -66,9 +74,12 @@ def _cmd_reference(a) -> int:
     if a.backend == "official":
         from .reference.official_backend import OfficialReference
 
+        from .reference.official_backend import load_hf_tokenizer
+
         ref = OfficialReference(
             a.code_dir, a.checkpoint, a.work_dir or f"{a.out}.converted", use_cpu_kernels=not a.gpu_kernels,
             text_only=a.text_only, max_seq_len=max(a.seq_len, 64), max_batch_size=a.batch,
+            tokenizer=load_hf_tokenizer(a.tokenizer or a.checkpoint),
         )
         vocab = ref.args_kwargs["vocab_size"]
     else:
@@ -76,9 +87,47 @@ def _cmd_reference(a) -> int:
 
         ref = HFReference(a.checkpoint)
         vocab = ref.model.config.vocab_size
-    trace = ref.trace(_input_ids(a, vocab))
+    ids = _input_ids(a, vocab)
+    if getattr(a, "text", None):
+        from tokenizers import Tokenizer
+
+        tok = Tokenizer.from_file(str(__import__("pathlib").Path(a.tokenizer or a.checkpoint) / "tokenizer.json"))
+        ids = torch.tensor([tok.encode(a.text).ids] * a.batch)
+    trace = ref.trace(ids, decode_from=a.decode_from) if a.backend == "official" else ref.trace(ids)
     trace.save(a.out)
     print(f"saved {len(trace.hidden_states)} hidden states + logits {tuple(trace.logits.shape)} to {a.out}.safetensors")
+    return 0
+
+
+def _cmd_trace(a) -> int:
+    from .engine import Engine
+
+    eng = Engine.load(a.checkpoint, max_seq_len=max(a.seq_len, 64), max_seqs=a.batch)
+    ids = _input_ids(a, eng.cfg.vocab_size)
+    if a.text:
+        ids = torch.tensor([eng.tokenizer.encode(a.text).ids] * a.batch)
+    trace = eng.trace(ids, decode_from=a.decode_from)
+    trace.save(a.out)
+    print(f"saved {len(trace.hidden_states)} hidden states + logits {tuple(trace.logits.shape)} to {a.out}.safetensors")
+    return 0
+
+
+def _cmd_generate(a) -> int:
+    import time
+
+    from .engine import Engine
+
+    eng = Engine.load(a.checkpoint, max_seq_len=a.max_seq_len)
+    if eng.tokenizer is None:
+        raise SystemExit("no tokenizer.json next to the checkpoint")
+    prompts = [eng.tokenizer.encode(p).ids for p in a.prompt]
+    t0 = time.perf_counter()
+    res = eng.generate(prompts, max_new_tokens=a.max_new_tokens, temperature=a.temperature, seed=a.seed)
+    dt = time.perf_counter() - t0
+    for p, toks in zip(a.prompt, res.tokens):
+        print(f"--- {p!r}\n{eng.tokenizer.decode(toks)}")
+    n = sum(len(t) for t in res.tokens)
+    print(f"[{n} tokens in {dt:.2f}s]", file=sys.stderr)
     return 0
 
 
@@ -106,6 +155,15 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--seed", type=int, default=0)
     s.set_defaults(fn=_cmd_make_tiny)
 
+    s = sub.add_parser("make-truncated", help="cut a small trained model (layer + expert subset) out of a real checkpoint")
+    s.add_argument("source", help="HF repo id or local checkpoint directory")
+    s.add_argument("out_dir")
+    s.add_argument("--layers", default="0,1,2,3,20,21,24", help="comma-separated source layer ids, in order")
+    s.add_argument("--experts", type=int, default=16, help="keep the first N routed experts per layer")
+    s.add_argument("--keep-engram", action="store_true")
+    s.add_argument("--revision", default="main")
+    s.set_defaults(fn=_cmd_make_truncated)
+
     s = sub.add_parser("reference", help="run a trusted reference and save a trace")
     s.add_argument("backend", choices=["official", "hf"])
     s.add_argument("checkpoint")
@@ -114,10 +172,32 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--work-dir", help="official: where to write the converted checkpoint")
     s.add_argument("--gpu-kernels", action="store_true", help="official: use the real TileLang kernels")
     s.add_argument("--text-only", action="store_true", help="official: drop the vision tower")
+    s.add_argument("--tokenizer", help="official: directory with tokenizer.json (default: the checkpoint); needed for engram")
     s.add_argument("--seq-len", type=int, default=32)
     s.add_argument("--batch", type=int, default=1)
     s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--decode-from", type=int, help="official: prefill this many tokens, then decode the rest one by one")
+    s.add_argument("--text", help="trace this text (tokenized with the checkpoint's tokenizer) instead of random ids")
     s.set_defaults(fn=_cmd_reference)
+
+    s = sub.add_parser("trace", help="run the Boilerplate engine (Mode A) and save a trace comparable to a reference trace")
+    s.add_argument("checkpoint")
+    s.add_argument("--out", required=True, help="trace path prefix")
+    s.add_argument("--seq-len", type=int, default=32)
+    s.add_argument("--batch", type=int, default=1)
+    s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--text", help="trace this text instead of random token ids")
+    s.add_argument("--decode-from", type=int, help="prefill this many tokens, then decode the rest one by one")
+    s.set_defaults(fn=_cmd_trace)
+
+    s = sub.add_parser("generate", help="generate text with the Boilerplate engine")
+    s.add_argument("checkpoint")
+    s.add_argument("prompt", nargs="+")
+    s.add_argument("--max-new-tokens", type=int, default=32)
+    s.add_argument("--temperature", type=float, default=0.0)
+    s.add_argument("--seed", type=int)
+    s.add_argument("--max-seq-len", type=int, default=4096)
+    s.set_defaults(fn=_cmd_generate)
 
     s = sub.add_parser("compare", help="compare two traces layer by layer")
     s.add_argument("reference")

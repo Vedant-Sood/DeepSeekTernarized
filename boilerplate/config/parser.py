@@ -316,7 +316,11 @@ def parse_checkpoint(src: CheckpointSource) -> ModelSpec:
         role_formats[roles.classify(n)][fmt] += 1
     if src.headers is not None and declared.get("weight_block_size"):
         bo, bi = declared["weight_block_size"]
-        observed = {f for f in formats if f.startswith("fp8_e4m3/block")}
+        # lookup tables (engram) carry one scale per row per 32 values by design; the declared
+        # block size is about linear weights
+        observed = {
+            f for role, c in role_formats.items() if role != "engram_table" for f in c if f.startswith("fp8_e4m3/block")
+        }
         if observed and observed != {f"fp8_e4m3/block{bo}x{bi}/F8_E8M0"} and observed != {f"fp8_e4m3/block{bo}x{bi}/F32"}:
             warnings.append(f"declared weight_block_size {declared['weight_block_size']} but observed {sorted(observed)}")
     if src.headers is None:

@@ -14,11 +14,14 @@ dependencies = [
     "safetensors>=0.7",
     "numpy",
     "pyyaml",
+    "tokenizers>=0.20",
 ]
 
 [project.optional-dependencies]
 hf = ["transformers>=4.50", "huggingface_hub>=0.25"]
 dev = ["pytest>=8"]
+# the vendored official reference imports these at module load; tokenizers also feeds engram hashing
+reference = ["sympy", "Pillow", "tokenizers>=0.20", "transformers>=4.50"]
 
 [project.scripts]
 boilerplate = "boilerplate.cli:main"
