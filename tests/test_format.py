@@ -115,10 +115,21 @@ def test_mixed_mode_b_c_export_and_run(tiny, ids, tmp_path):
     src, dst = WeightStore(tiny), WeightStore(mixed)
     coded_names = [name for entry in meta.values() if entry["mode"] == "B" for name in entry["coded"]]
     assert coded_names
-    b_names = [f"{base}.{suffix}" for base, entry in meta.items() if entry["mode"] == "B"
-               for suffix in ("weight", "scale") if f"{base}.{suffix}" in src]
+    b_names = [name for base, entry in meta.items() if entry["mode"] == "B"
+               for name in (base, f"{base}.weight", f"{base}.scale") if name in src]
     assert set(coded_names) <= set(b_names)
+    for name in ("layers.1.engram.q_weight", "layers.1.engram.k_weight"):
+        assert meta[name]["mode"] == "B" and name in coded_names
     for name in b_names:
+        assert torch.equal(src.get(name).view(torch.uint8), dst.get(name).view(torch.uint8)), name
+    source_names = set(src.names())
+    for name in source_names:
+        if name.endswith(".weight") or (name.endswith(".scale") and f"{name[:-6]}.weight" in source_names):
+            continue
+        if src.get(name).element_size() <= 2:
+            assert meta[name]["mode"] == "B" and name in coded_names
+        else:
+            assert meta[name]["mode"] == "A"
         assert torch.equal(src.get(name).view(torch.uint8), dst.get(name).view(torch.uint8)), name
 
     expected = Engine.load(c_only, max_seq_len=128).trace(ids, decode_from=13)

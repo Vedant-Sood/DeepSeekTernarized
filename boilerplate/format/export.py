@@ -11,8 +11,8 @@ Output directory:
     2-byte dtypes, ``T.hraw`` (the uncoded low bytes). See ``entropy.py`` for the stream layout.
   - Mode C: ``X.tq{i}.packed`` (uint8, TQ2/TQ1 rows, see ``ternary/pack.py``) and ``X.tq{i}.scale``
     ([N, ceil(K / group)], FP16/BF16) for each term i.
-  Tensors that are not weights of a linear/table (norms, biases, hyper-connection params) are
-  always Mode A.
+  Supported one- and two-byte tensors outside a weight/scale pair can also use Mode B;
+  other non-weight tensors stay in their original format.
 * ``manifest.json``: format version, architecture (the source config), policy, and per weight:
   mode, logical shape, source dtype, packing, terms, group size, scale dtype, activation mode, the
   stored tensor names with SHA-256 checksums, stored bytes; plus a size summary with effective
@@ -142,6 +142,23 @@ def export(
         m[0] += params
         m[1] += nb
 
+    def encode_lossless(tnames):
+        stored, parts_meta = {}, {}
+        for n in tnames:
+            t = ws.get(n)
+            if t.element_size() > 2:
+                stored[n] = t
+                continue
+            p = entropy.encode(t)
+            parts_meta[n] = {"dtype": str(t.dtype).replace("torch.", ""), "shape": list(t.shape),
+                             "symbols": entropy.split_bytes(t)[0].numel()}
+            stored[f"{n}.hstream"] = p["stream"]
+            stored[f"{n}.hoffsets"] = p["offsets"]
+            stored[f"{n}.hlens"] = p["lens"]
+            if "raw" in p:
+                stored[f"{n}.hraw"] = p["raw"]
+        return stored, parts_meta
+
     done = 0
     for base, tnames in sorted(bases.items()):
         rule = policy.rule_for(base)
@@ -173,20 +190,7 @@ def export(
             meta.update(packing=rule.packing, terms=rule.k, group=rule.group, scale_dtype=rule.scale_dtype, act=rule.act, gptq=rule.gptq)
             record(base, meta, stored, params)
         elif rule.mode == "B":
-            stored = {}
-            parts_meta = {}
-            for n in tnames:
-                t = ws.get(n)
-                if t.element_size() > 2:
-                    stored[n] = t
-                    continue
-                p = entropy.encode(t)
-                parts_meta[n] = {"dtype": str(t.dtype).replace("torch.", ""), "shape": list(t.shape), "symbols": entropy.split_bytes(t)[0].numel()}
-                stored[f"{n}.hstream"] = p["stream"]
-                stored[f"{n}.hoffsets"] = p["offsets"]
-                stored[f"{n}.hlens"] = p["lens"]
-                if "raw" in p:
-                    stored[f"{n}.hraw"] = p["raw"]
+            stored, parts_meta = encode_lossless(tnames)
             meta.update(coded=parts_meta, maxlen=entropy.MAXLEN, block=entropy.BLOCK)
             record(base, meta, stored, params)
         else:
@@ -195,11 +199,17 @@ def export(
         done += 1
         if done % 200 == 0:
             log(f"  {done}/{len(bases)} weights")
-    # everything else (norms, biases, hc params, sinks) stays as is
+    # Non-weight tensors can use Mode B too; wider dtypes and Mode C selections stay original.
     for n in names:
         if n not in in_base:
             t = ws.get(n)
-            record(n, {"mode": "A", "shape": list(t.shape), "source_dtype": str(t.dtype).replace("torch.", "")}, {n: t}, t.numel())
+            meta = {"mode": "A", "shape": list(t.shape), "source_dtype": str(t.dtype).replace("torch.", "")}
+            if policy.rule_for(n).mode == "B" and t.element_size() <= 2:
+                stored, parts_meta = encode_lossless([n])
+                meta.update(mode="B", coded=parts_meta, maxlen=entropy.MAXLEN, block=entropy.BLOCK)
+            else:
+                stored = {n: t}
+            record(n, meta, stored, t.numel())
 
     weight_map = writer.finish()
     for meta in tensors_meta.values():
