@@ -26,7 +26,7 @@ from ..kernels import torch_ref as K
 from .config import EngineConfig
 from .engram import EngramHasher, EngramLayout
 from .kv_cache import KVCache, Sequence
-from .weights import WeightStore
+from .weights import TensorRef, WeightStore
 from ..ternary.ops import PackedTerm, TernaryLinear
 from ..ternary.pack import unpack
 
@@ -70,6 +70,10 @@ class DequantCache:
         return t
 
 
+def _tensor(value):
+    return value.get() if isinstance(value, TensorRef) else value
+
+
 class QLinear:
     """y = x @ W^T for a weight in its stored format. FP8/FP4 weights take a block-quantized FP8
     activation (per 32 values, power-of-two scale), as the reference ``linear()`` does; other
@@ -77,25 +81,40 @@ class QLinear:
 
     cache: DequantCache | None = None  # set by V4Model
 
-    def __init__(self, weight: torch.Tensor, scale: torch.Tensor | None = None, act_block: int = 32):
-        self.weight, self.scale, self.act_block = weight, scale, act_block
+    def __init__(self, weight: torch.Tensor | TensorRef, scale: torch.Tensor | TensorRef | None = None,
+                 act_block: int = 32, weight_dtype: torch.dtype | None = None):
+        if weight_dtype is not None and isinstance(weight, torch.Tensor):
+            weight, weight_dtype = weight.to(weight_dtype), None
+        self._weight, self._scale, self.act_block, self.weight_dtype = weight, scale, act_block, weight_dtype
+        wshape = weight.shape
+        sshape = scale.shape if scale is not None else None
         if scale is None:
             self.kind = "dense"
         elif weight.dtype == torch.float8_e4m3fn:
             self.kind = "fp8"
             b = act_block
-            if (weight.size(0) + b - 1) // b != scale.size(0) or (weight.size(1) + b - 1) // b != scale.size(1):
+            if (wshape[0] + b - 1) // b != sshape[0] or (wshape[1] + b - 1) // b != sshape[1]:
                 # the torch kernel assumes square weight blocks equal to the activation block
-                raise ValueError(f"unsupported FP8 block layout {tuple(weight.shape)} / {tuple(scale.shape)}")
+                raise ValueError(f"unsupported FP8 block layout {tuple(wshape)} / {tuple(sshape)}")
         elif weight.dtype in (torch.int8, torch.uint8, torch.float4_e2m1fn_x2):
             self.kind = "fp4"
-            self.weight = weight.view(torch.uint8)
         else:
             raise ValueError(f"scaled weight of dtype {weight.dtype}")
 
     @property
+    def weight(self) -> torch.Tensor:
+        weight = _tensor(self._weight)
+        if self.kind == "fp4":
+            return weight.view(torch.uint8)
+        return weight.to(self.weight_dtype) if self.weight_dtype is not None else weight
+
+    @property
+    def scale(self) -> torch.Tensor | None:
+        return _tensor(self._scale)
+
+    @property
     def out_features(self) -> int:
-        return self.weight.size(0)
+        return self._weight.shape[0]
 
     def dequantized(self) -> torch.Tensor:
         if self.kind == "fp8":
@@ -223,9 +242,9 @@ class V4Model:
             self.hasher = EngramHasher(cfg.engram, self.engram_layout, tokenizer)
         W = weights
         g = W.get
-        self.embed = g("embed.weight")
-        self.norm = g("norm.weight")
-        self.head = g("head.weight")
+        self.embed = W.ref("embed.weight")
+        self.norm = W.ref("norm.weight")
+        self.head = W.ref("head.weight")
         self.layers = []
         main_rope = rope_table(cfg.rope_head_dim, max_seq_len, 0, cfg.rope_theta, cfg.rope_factor, cfg.beta_fast, cfg.beta_slow)
         comp_rope = rope_table(
@@ -244,12 +263,12 @@ class V4Model:
             L.is_kv_src = i in cfg.kv_source_layers
             L.is_idx_src = i in cfg.index_source_layers and L.ratio > 0
             L.rope = comp_rope if L.ratio else main_rope
-            L.attn_norm, L.ffn_norm = g(f"{p}.attn_norm.weight"), g(f"{p}.ffn_norm.weight")
+            L.attn_norm, L.ffn_norm = W.ref(f"{p}.attn_norm.weight"), W.ref(f"{p}.ffn_norm.weight")
             L.hc = {sub: (g(f"{p}.hc_{sub}_fn").float(), g(f"{p}.hc_{sub}_scale").float(), g(f"{p}.hc_{sub}_base").float()) for sub in ("attn", "ffn")}
             a = f"{p}.attn"
             L.sink = g(f"{a}.attn_sink").float()
             L.wq_a, L.wq_b, L.wkv, L.wo_b = lin(f"{a}.wq_a"), lin(f"{a}.wq_b"), lin(f"{a}.wkv"), lin(f"{a}.wo_b")
-            L.q_norm, L.kv_norm = g(f"{a}.q_norm.weight"), g(f"{a}.kv_norm.weight")
+            L.q_norm, L.kv_norm = W.ref(f"{a}.q_norm.weight"), W.ref(f"{a}.kv_norm.weight")
             # wo_a is applied per output group (block-diagonal), as an einsum in BF16 over the
             # dequantized weight -- the reference's convert.py dequantizes it the same way
             wo_a, wo_a_s = g(f"{a}.wo_a.weight"), W.maybe(f"{a}.wo_a.scale")
@@ -259,17 +278,17 @@ class V4Model:
                 c = f"{a}.compressor"
                 # ratio 1 is a plain BF16 projection; pooled ratios run in FP32 (reference Compressor)
                 cdt = torch.float32 if L.ratio > 1 else torch.bfloat16
-                L.c_wkv = QLinear(g(f"{c}.wkv.weight").to(cdt))
-                L.c_wgate = QLinear(g(f"{c}.wgate.weight").to(torch.float32)) if L.ratio > 1 else None
-                L.c_norm = g(f"{c}.norm.weight")
+                L.c_wkv = QLinear(W.ref(f"{c}.wkv.weight"), weight_dtype=cdt)
+                L.c_wgate = QLinear(W.ref(f"{c}.wgate.weight"), weight_dtype=torch.float32) if L.ratio > 1 else None
+                L.c_norm = W.ref(f"{c}.norm.weight")
             if L.is_idx_src:
                 x_ = f"{a}.indexer"
                 L.i_wq_b = lin(f"{x_}.wq_b")
-                L.i_weights = QLinear(g(f"{x_}.weights_proj.weight").bfloat16())
+                L.i_weights = QLinear(W.ref(f"{x_}.weights_proj.weight"), weight_dtype=torch.bfloat16)
                 L.i_owns_k = L.is_kv_src
                 if L.i_owns_k:
-                    L.i_wk = QLinear(g(f"{x_}.wk.weight").bfloat16())
-                    L.i_k_norm = g(f"{x_}.k_norm.weight")
+                    L.i_wk = QLinear(W.ref(f"{x_}.wk.weight"), weight_dtype=torch.bfloat16)
+                    L.i_k_norm = W.ref(f"{x_}.k_norm.weight")
                 L.cand_source = i == cfg.candidate_source_layer
                 L.uses_cand = 0 <= cfg.candidate_source_layer < i
             f = f"{p}.ffn"
@@ -285,12 +304,15 @@ class V4Model:
                 E = _NS()
                 E.index = self.engram_layout.layer_ids.index(i)
                 tm = W.mode_of(f"{e}.embed")
+                E.coded_table = f"{e}.embed" if f"{e}.embed.weight" in W.coded else None
                 if tm["mode"] == "C":  # ternary lookup table: rows are dequantized on lookup
                     E.table = None
                     E.tq = [(g(f"{e}.embed.tq{i}.packed"), g(f"{e}.embed.tq{i}.scale")) for i in range(tm["terms"])]
                     E.tq_fmt, E.tq_group, E.tq_K = tm["packing"], tm["group"], tm["shape"][1]
-                else:
+                elif E.coded_table is None:
                     E.table, E.table_scale = g(f"{e}.embed.weight"), g(f"{e}.embed.scale")
+                else:
+                    E.table = None
                 E.wkv = lin(f"{e}.wkv")
                 E.weight = g(f"{e}.q_weight").bfloat16().float() * g(f"{e}.k_weight").bfloat16().float()
                 L.engram = E
@@ -308,7 +330,7 @@ class V4Model:
             terms = [PackedTerm(self.w.get(f"{base}.tq{i}.packed"), self.w.get(f"{base}.tq{i}.scale")) for i in range(m["terms"])]
             lin = TernaryLinear(terms, m["shape"][1], m["packing"], m["group"], act=m.get("act", "int8"), backend=self.ternary_backend)
         else:  # A, or B (WeightStore decodes B back to the original bytes)
-            lin = QLinear(self.w.get(f"{base}.weight"), self.w.maybe(f"{base}.scale"), self.cfg.fp8_block)
+            lin = QLinear(self.w.ref(f"{base}.weight"), self.w.maybe_ref(f"{base}.scale"), self.cfg.fp8_block)
         lin.name = base
         return lin
 
@@ -382,7 +404,12 @@ class V4Model:
         """h: [1, T, hc, dim]; hash_ids: [1, T, n_cols] (reference Engram + ParallelEngramEmbedding)."""
         dim, hc = self.cfg.dim, self.cfg.hc_mult
         flat = hash_ids.reshape(-1)
-        if E.table is not None:
+        if E.coded_table is not None:
+            rows = self.w.rows(f"{E.coded_table}.weight", flat).float()
+            scales = self.w.rows(f"{E.coded_table}.scale", flat).float()
+            blk = rows.size(-1) // scales.size(-1)
+            vals = (rows.unflatten(-1, (-1, blk)) * scales.unsqueeze(-1)).flatten(-2).to(torch.bfloat16)
+        elif E.table is not None:
             rows = E.table.index_select(0, flat).float()
             scales = E.table_scale.index_select(0, flat).float()
             blk = rows.size(-1) // scales.size(-1)
@@ -410,10 +437,10 @@ class V4Model:
         cfg = self.cfg
         rd, H, hd = cfg.rope_head_dim, cfg.n_heads, cfg.head_dim
         freqs = L.rope[positions]  # [T, rd/2]
-        qr = rms_norm(L.wq_a(x), L.q_norm, cfg.norm_eps)
+        qr = rms_norm(L.wq_a(x), _tensor(L.q_norm), cfg.norm_eps)
         q = L.wq_b(qr).unflatten(-1, (H, hd))
         apply_rope_(q[..., -rd:], freqs)
-        kv = rms_norm(L.wkv(x), L.kv_norm, cfg.norm_eps)
+        kv = rms_norm(L.wkv(x), _tensor(L.kv_norm), cfg.norm_eps)
         apply_rope_(kv[..., -rd:], freqs)
         K.act_quant(kv, cfg.fp8_block, "ue8m0", SCALE_DTYPE, True)
 
@@ -424,7 +451,7 @@ class V4Model:
                 xf = x.float()
                 comp = (L.c_wkv(xf), L.c_wgate(xf))
             else:
-                comp = (rms_norm(L.c_wkv(x), L.c_norm, cfg.norm_eps), None)
+                comp = (rms_norm(L.c_wkv(x), _tensor(L.c_norm), cfg.norm_eps), None)
         idx_q = idx_w = None
         if L.is_idx_src:
             idx_q = L.i_wq_b(qr).unflatten(-1, (cfg.index_n_heads, cfg.index_head_dim))
@@ -513,7 +540,7 @@ class V4Model:
             if (start + 1) % r:
                 return None
             pooled = (tail_kv.unsqueeze(0) * tail_s.unsqueeze(0).softmax(dim=1)).sum(dim=1, keepdim=True)
-        return rms_norm(pooled.to(ACT_DTYPE), L.c_norm, cfg.norm_eps)
+        return rms_norm(pooled.to(ACT_DTYPE), _tensor(L.c_norm), cfg.norm_eps)
 
     def _index(self, L, sg: Segment, latent, idx_q, idx_w, offset: int, cache: KVCache, shared: dict):
         """Top-k compressed positions per query (reference Indexer + select_candidate_blocks)."""
@@ -522,7 +549,7 @@ class V4Model:
         pool = cache.ik[L.kv_src]
         if L.i_owns_k and latent is not None:
             fr = L.rope[: n - n % r : r] if start == 0 else L.rope[start + 1 - r].unsqueeze(0)
-            k = rms_norm(L.i_wk(latent), L.i_k_norm, cfg.norm_eps)
+            k = rms_norm(L.i_wk(latent), _tensor(L.i_k_norm), cfg.norm_eps)
             apply_rope_(k[..., -rd:], fr)
             K.fp4_act_quant(k, 32, True)
             cache.write_compressed(pool, seq, r, start // r, k[0])
@@ -549,11 +576,15 @@ class V4Model:
     def logits(self, h: torch.Tensor) -> torch.Tensor:
         """h: [..., dim] BF16 after the final norm -> FP32 logits (the reference keeps the head in FP32)."""
         x = h.float()
-        if self.head.size(0) <= self.head_chunk:
+        head_rows = self.head.shape[0]
+        if head_rows <= self.head_chunk:
             if self._head_f32 is None:
-                self._head_f32 = self.head.float()
+                self._head_f32 = _tensor(self.head).float()
             return F.linear(x, self._head_f32)
-        return torch.cat([F.linear(x, self.head[i : i + self.head_chunk].float()) for i in range(0, self.head.size(0), self.head_chunk)], -1)
+        if isinstance(self.head, TensorRef):
+            return torch.cat([F.linear(x, self.w.row_range(self.head.name, i, min(i + self.head_chunk, head_rows)).float())
+                              for i in range(0, head_rows, self.head_chunk)], -1)
+        return torch.cat([F.linear(x, self.head[i : i + self.head_chunk].float()) for i in range(0, head_rows, self.head_chunk)], -1)
 
     @torch.inference_mode()
     def forward(
@@ -585,7 +616,7 @@ class V4Model:
         ids_t, positions = torch.cat(ids), torch.cat(pos)
         hash_ids = torch.cat(hashes).unsqueeze(0) if hashes else None  # [1, T, L_engram, cols]
 
-        h = F.embedding(ids_t, self.embed).unsqueeze(0)  # [1, T, dim]
+        h = (self.w.rows(self.embed.name, ids_t) if isinstance(self.embed, TensorRef) else F.embedding(ids_t, self.embed)).unsqueeze(0)
         h = h.unsqueeze(2).repeat(1, 1, cfg.hc_mult, 1)
         pre = h.new_zeros(1, h.size(1), cfg.hc_mult, dtype=torch.float32)
         pre[..., 0] = 1.0
@@ -595,12 +626,12 @@ class V4Model:
                 h = self.engram(L.engram, h, hash_ids[:, :, L.engram.index])
             residual = h
             a_pre, a_post, a_comb = self.hc_mixes(h, *L.hc["attn"])
-            x = rms_norm(self.hc_pre(h, pre), L.attn_norm, cfg.norm_eps)
+            x = rms_norm(self.hc_pre(h, pre), _tensor(L.attn_norm), cfg.norm_eps)
             x = self.attention(L, x, segs, positions, cache, shared)
             h = self.hc_post(x, residual, a_post, a_comb)
             residual = h
             f_pre, f_post, f_comb = self.hc_mixes(h, *L.hc["ffn"])
-            x = rms_norm(self.hc_pre(h, a_pre), L.ffn_norm, cfg.norm_eps)
+            x = rms_norm(self.hc_pre(h, a_pre), _tensor(L.ffn_norm), cfg.norm_eps)
             x = self.moe(L, x)
             h = self.hc_post(x, residual, f_post, f_comb)
             pre = f_pre
@@ -608,7 +639,7 @@ class V4Model:
                 capture.append(h[0].clone())
         for sg in segs:
             sg.seq.length += sg.n
-        h = rms_norm(self.hc_pre(h, pre), self.norm, cfg.norm_eps)[0]  # [T, dim]
+        h = rms_norm(self.hc_pre(h, pre), _tensor(self.norm), cfg.norm_eps)[0]  # [T, dim]
         if not all_logits:
             h = h[torch.tensor([sg.hi - 1 for sg in segs])]
         return self.logits(h)

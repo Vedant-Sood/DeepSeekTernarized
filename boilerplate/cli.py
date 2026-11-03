@@ -102,7 +102,8 @@ def _cmd_reference(a) -> int:
 def _cmd_trace(a) -> int:
     from .engine import Engine
 
-    eng = Engine.load(a.checkpoint, max_seq_len=max(a.seq_len, 64), max_seqs=a.batch)
+    eng = Engine.load(a.checkpoint, max_seq_len=max(a.seq_len, 64), max_seqs=a.batch,
+                      mode_b_cache_bytes=a.mode_b_cache_mib << 20)
     ids = _input_ids(a, eng.cfg.vocab_size)
     if a.text:
         ids = torch.tensor([eng.tokenizer.encode(a.text).ids] * a.batch)
@@ -117,7 +118,7 @@ def _cmd_generate(a) -> int:
 
     from .engine import Engine
 
-    eng = Engine.load(a.checkpoint, max_seq_len=a.max_seq_len)
+    eng = Engine.load(a.checkpoint, max_seq_len=a.max_seq_len, mode_b_cache_bytes=a.mode_b_cache_mib << 20)
     if eng.tokenizer is None:
         raise SystemExit("no tokenizer.json next to the checkpoint")
     prompts = [eng.tokenizer.encode(p).ids for p in a.prompt]
@@ -133,14 +134,17 @@ def _cmd_generate(a) -> int:
 
 def _cmd_bench(a) -> int:
     """Prefill and decode throughput of the engine, with peak resident memory."""
+    import os
     import resource
     import time
 
     from .engine import Engine
 
+    torch.set_num_threads(a.threads)
     torch.manual_seed(a.seed)
     t0 = time.perf_counter()
-    eng = Engine.load(a.checkpoint, max_seq_len=a.prompt_len + a.gen_len + 1, max_seqs=a.batch, max_tokens=a.batch * (a.prompt_len + a.gen_len + 64))
+    eng = Engine.load(a.checkpoint, max_seq_len=a.prompt_len + a.gen_len + 1, max_seqs=a.batch,
+                      max_tokens=a.batch * (a.prompt_len + a.gen_len + 64), mode_b_cache_bytes=a.mode_b_cache_mib << 20)
     t_load = time.perf_counter() - t0
     cache = eng.new_cache()
     seqs = [cache.new_sequence() for _ in range(a.batch)]
@@ -159,12 +163,19 @@ def _cmd_bench(a) -> int:
         "prompt_len": a.prompt_len,
         "gen_len": a.gen_len,
         "threads": torch.get_num_threads(),
+        "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+        "mkl_dynamic": os.environ.get("MKL_DYNAMIC"),
         "load_s": round(t_load, 3),
         "prefill_tok_s": round(a.batch * a.prompt_len / t_pre, 2),
         "decode_tok_s": round(a.batch * a.gen_len / t_dec, 3) if a.gen_len else None,
         "peak_rss_gb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6, 2),
         "kv_pages_in_use": cache.pages_in_use,
         "kernel_backend": "torch_ref",
+        "mode_b_cache_budget_bytes": eng.model.w.mode_b_cache_bytes,
+        "mode_b_cache_used_bytes": eng.model.w.mode_b_cache_used,
+        "mode_b_cache_hits": eng.model.w.mode_b_cache_hits,
+        "mode_b_cache_misses": eng.model.w.mode_b_cache_misses,
+        "mode_b_cache_evictions": eng.model.w.mode_b_cache_evictions,
     }
     print(json.dumps(res, indent=2))
     return 0
@@ -254,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--seed", type=int, default=0)
     s.add_argument("--text", help="trace this text instead of random token ids")
     s.add_argument("--decode-from", type=int, help="prefill this many tokens, then decode the rest one by one")
+    s.add_argument("--mode-b-cache-mib", type=int, default=256, help="maximum decoded Mode B bytes retained in the LRU (MiB)")
     s.set_defaults(fn=_cmd_trace)
 
     s = sub.add_parser("generate", help="generate text with the Boilerplate engine")
@@ -263,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--temperature", type=float, default=0.0)
     s.add_argument("--seed", type=int)
     s.add_argument("--max-seq-len", type=int, default=4096)
+    s.add_argument("--mode-b-cache-mib", type=int, default=256, help="maximum decoded Mode B bytes retained in the LRU (MiB)")
     s.set_defaults(fn=_cmd_generate)
 
     s = sub.add_parser("bench", help="measure engine prefill/decode throughput and peak memory")
@@ -271,6 +284,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--gen-len", type=int, default=16)
     s.add_argument("--batch", type=int, default=1)
     s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--threads", type=int, default=4, help="PyTorch CPU math threads")
+    s.add_argument("--mode-b-cache-mib", type=int, default=256, help="maximum decoded Mode B bytes retained in the LRU (MiB)")
     s.set_defaults(fn=_cmd_bench)
 
     s = sub.add_parser("compare", help="compare two traces layer by layer")

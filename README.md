@@ -8,8 +8,8 @@ use ~1.6–2 bits/weight.
 
 Status: **M0** (skeleton, config parser, reference harness), **M1** (Mode A engine, bit-exact
 with the official reference) and **M2** (TQ1/TQ2 packing, CPU ternary kernel, Mode C with optional
-GPTQ) are implemented. **M3** has CPU Mode B, bit-exact with Mode A; bounded decoding and GPU
-support remain open. See `docs/reports/`,
+GPTQ) are implemented. **M3** has CPU Mode B, bit-exact with Mode A, and an on-demand decoded
+weight cache; the real-slice memory acceptance check and GPU support remain open. See `docs/reports/`,
 `docs/architecture/format.md` for the on-disk format,
 `docs/architecture/deepseek_v41_flash.md` for what the checkpoint contains and
 `docs/architecture/engine.md` for the engine design.
@@ -22,7 +22,8 @@ support remain open. See `docs/reports/`,
   the real weights without engram. That validates the engine around the kernels, not the full
   model's quality. See `docs/reports/M1.md` for the exact scope.
 * **Mode B** losslessly encodes supported weights on disk and decodes them to the original bytes.
-  It currently retains decoded tensors, so it is not yet a bounded-memory runtime.
+  Decoded tensors and table blocks use an LRU with a configurable byte budget; transient decoding
+  and process RSS are not limited by that budget.
 * **Mode C** exports and runs stacked ternary weights with TQ1/TQ2 packing, CPU kernels and
   optional GPTQ. A mixed Mode B + C policy is available. Mode D QAT is not implemented.
 
@@ -82,6 +83,11 @@ from boilerplate.engine import Engine
 eng = Engine.load("./tiny")
 eng.generate([[0, 17, 42]], max_new_tokens=8, temperature=0).tokens
 ```
+
+For Mode B, `Engine.load(path, mode_b_cache_bytes=256 << 20)` sets the decoded-byte LRU budget;
+zero disables retention. The `trace`, `generate` and `bench` commands also accept
+`--mode-b-cache-mib` (default 256). Temporary decode buffers, other caches and mmap pages are
+outside this limit.
 
 ## Layout
 

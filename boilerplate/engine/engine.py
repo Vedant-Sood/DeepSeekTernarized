@@ -52,11 +52,13 @@ class Engine:
         self.cache_args = dict(max_seqs=max_seqs, max_tokens=max_tokens, page_size=page_size)
 
     @classmethod
-    def load(cls, path: str | Path, max_seq_len: int = 4096, tokenizer_path: str | Path | None = None, **cache_args) -> "Engine":
+    def load(cls, path: str | Path, max_seq_len: int = 4096, tokenizer_path: str | Path | None = None,
+             mode_b_cache_bytes: int = 256 << 20, dequant_cache_bytes: int = 2 << 30, **cache_args) -> "Engine":
         path = Path(path)
         cfg = EngineConfig.from_dir(path)
         tok = load_tokenizer(tokenizer_path or path)
-        model = V4Model(cfg, WeightStore(path), tokenizer=tok, max_seq_len=max_seq_len)
+        model = V4Model(cfg, WeightStore(path, mode_b_cache_bytes=mode_b_cache_bytes), tokenizer=tok,
+                        max_seq_len=max_seq_len, dequant_cache_bytes=dequant_cache_bytes)
         return cls(model, tok, **cache_args)
 
     def new_cache(self) -> KVCache:
