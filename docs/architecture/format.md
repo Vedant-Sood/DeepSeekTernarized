@@ -16,9 +16,10 @@ source checkpoint, so every tensor is Mode A).
 
 ## Policy
 
-A YAML list of rules, tried in order. The first rule whose regex `search`es a weight's base name
-(the tensor name without `.weight`) decides how that weight is stored. Tensors that are not weights
-(norms, biases, hyper-connection parameters, attention sinks) are always Mode A.
+A YAML list of rules, tried in order. For a weight, the first rule whose regex `search`es its base
+name (the tensor name without `.weight`) decides how that weight and its scale are stored. For
+other tensors, rules match the full tensor name. Mode B codes supported one- and two-byte tensors;
+wider tensors remain unchanged. Mode C applies only to eligible two-dimensional weights.
 
 ```yaml
 name: experts-k2
@@ -32,14 +33,18 @@ rules:
     scale_dtype: fp16
     act: int8        # int8 per-token absmax activations into the layer | bf16
     gptq: false      # GPTQ error compensation (needs --calib-text at export)
+    quantizer: residual  # residual fit | absmean (single term only)
     allow_larger: false
 ```
 
-A Mode C setting costs `k * (bits(packing) + 16 / group)` bits per weight. The exporter compares
-that with what the source tensor actually uses, including its scales, and refuses a setting that
-is not below 0.85x the source unless `allow_larger: true`. V4.1's routed experts are FP4 with one
+A Mode C setting costs approximately `k * (bits(packing) + 16 / group)` bits per weight. For
+`K` input columns, the exporter uses the exact per-row cost
+`8 * k * (ceil(K / trits_per_byte) + 2 * ceil(K / group)) / K`, including row and scale-group
+padding. It compares that with what the source tensor actually uses, including its scales, and
+refuses a setting that is not below 0.85x the source unless `allow_larger: true` is used for a
+clearly labelled side experiment. V4.1's routed experts are FP4 with one
 e8m0 scale per 32 weights, so they use 4.25 b/w. TQ2 k=2 costs 4.25 b/w too, so it is refused.
-TQ1 k=2 costs 3.45 b/w and is allowed.
+TQ1 k=2 costs approximately 3.45 b/w and is allowed.
 
 Shipped policies (`configs/policy/`):
 
@@ -48,8 +53,10 @@ Shipped policies (`configs/policy/`):
 | `experts_k2.yaml` | routed experts, TQ1 k=2 | 3.45 |
 | `experts_k1.yaml` | routed experts, TQ1 k=1 | 1.725 |
 | `experts_engram_k2.yaml` | routed experts and both engram tables, TQ1 k=2 | 3.45 |
-| `lossless.yaml` | every weight Mode B | n/a |
-| `experts_k2_lossless_rest.yaml` | routed experts Mode C; other supported weights Mode B | 3.45 for experts |
+| `lossless.yaml` | supported tensors Mode B; wider tensors unchanged | n/a |
+| `experts_k2_lossless_rest.yaml` | routed experts Mode C; other supported tensors Mode B | 3.45 for experts |
+| `standard_absmean_tq{1,2}[_gptq].yaml` | Llama/OLMoE block linears, absmean k=1 | depends on row padding |
+| `standard_k2_tq1[_gptq].yaml` | Llama/OLMoE block linears, residual k=2 | depends on row padding |
 
 ## Stored tensors per mode
 
@@ -67,6 +74,16 @@ For a weight with base name `X`:
   MSB-first, at most 12 bits long, and come in blocks of 4096 symbols. Each block decodes
   independently with one 4096-entry table of `(symbol << 8) | length`, indexed by the next 12 bits.
   4-byte tensors are stored as in Mode A.
+
+  The CPU engine decodes coded linears on demand. Embeddings and engram tables are decoded by
+  the independent Huffman blocks covering requested rows; the language-model head is decoded
+  in row chunks. The decoded-byte LRU is controlled by `mode_b_cache_bytes` in `Engine.load` or
+  `--mode-b-cache-mib` in the CLI. It bounds retained cache entries, not temporary decode
+  buffers, PyTorch's separate FP32 dequantization cache, file-backed mmap pages, or process RSS.
+  The CPU engine aligns FP32 hyper-connection matrices as in the official reference, since
+  BLAS may choose a different reduction order for differently aligned checkpoint layouts.
+  An optional CUDA Huffman decoder source can write decoded bytes into a reusable GPU buffer;
+  it has not yet been compiled or validated on a GPU or integrated into the engine's GEMM path.
 * **Mode C**: for each term `i` in `0..k-1`:
   - `X.tq{i}.packed` uint8 `[N, ceil(K / per_byte)]`: the trits, row-major, with the reduction dim
     K contiguous;
@@ -92,7 +109,7 @@ alignment, but groups of 128 or 256 keep each group's inner loop a whole number 
 {
   "format": "boilerplate", "version": 1,
   "source": "...", "architecture": { ...source config.json... },
-  "policy": { "name": ..., "rules": [...] },
+  "policy": { "name": ..., "default": {"mode": ...}, "rules": [...] },
   "summary": {
     "params": ..., "bytes": ..., "bits_per_weight": ...,          // whole model, everything stored
     "by_mode": {"A": {"params", "bytes", "bits_per_weight"}, "C": {...}, "B": {...}}

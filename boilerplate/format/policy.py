@@ -27,10 +27,18 @@ class Rule:
     scale_dtype: str = "fp16"
     act: str = "int8"
     gptq: bool = False
+    quantizer: str = "residual"  # optimal residual fit, or single-term absmean
     allow_larger: bool = False  # permit Mode C settings that do not shrink the source (experiments)
 
-    def effective_bits(self) -> float:
-        """Bits per weight of a Mode C setting: k terms of packed trits plus one 16-bit scale per group."""
+    def effective_bits(self, columns: int | None = None) -> float:
+        """Mode C bits/weight; with ``columns``, include row and group padding exactly."""
+        if columns is not None:
+            if columns <= 0:
+                raise ValueError("columns must be positive")
+            per_byte = {"tq2": 4, "tq1": 5}[self.packing]
+            packed_bytes = (columns + per_byte - 1) // per_byte
+            scale_bytes = 2 * ((columns + self.group - 1) // self.group)
+            return 8.0 * self.k * (packed_bytes + scale_bytes) / columns
         return self.k * ({"tq2": 2.0, "tq1": 1.6}[self.packing] + 16.0 / self.group)
 
     def __post_init__(self):
@@ -40,8 +48,12 @@ class Rule:
         if self.mode == "C":
             if not 1 <= self.k <= 4:
                 raise ValueError("k must be 1..4")
+            if self.group <= 0:
+                raise ValueError("group must be positive")
             if self.packing not in ("tq2", "tq1"):
                 raise ValueError(f"packing {self.packing!r}")
+            if self.quantizer not in ("residual", "absmean") or (self.quantizer == "absmean" and self.k != 1):
+                raise ValueError("quantizer must be residual or single-term absmean")
             if self.scale_dtype not in ("fp16", "bf16"):
                 raise ValueError(f"scale_dtype {self.scale_dtype!r}")
             if self.act not in ("int8", "bf16"):
@@ -70,5 +82,9 @@ class Policy:
         return cls.from_dict(yaml.safe_load(Path(path).read_text()))
 
     def to_dict(self) -> dict:
-        keep = ("match", "mode", "k", "group", "packing", "scale_dtype", "act", "gptq", "allow_larger")
-        return {"name": self.name, "rules": [{k: getattr(r, k) for k in keep} for r in self.rules]}
+        keep = ("match", "mode", "k", "group", "packing", "scale_dtype", "act", "gptq", "quantizer", "allow_larger")
+        return {
+            "name": self.name,
+            "default": {k: getattr(self.default, k) for k in keep if k != "match"},
+            "rules": [{k: getattr(r, k) for k in keep} for r in self.rules],
+        }

@@ -9,6 +9,15 @@ import sys
 import torch
 
 
+def _rss_bytes(ru_maxrss: int, platform: str) -> int:
+    """Convert getrusage's peak RSS to bytes on supported platforms."""
+    if platform.startswith("linux"):
+        return ru_maxrss * 1024  # KiB on Linux
+    if platform == "darwin":
+        return ru_maxrss  # bytes on macOS
+    raise ValueError(f"unsupported ru_maxrss units on platform {platform!r}")
+
+
 def _cmd_inspect(a) -> int:
     from .checkpoint import CheckpointSource
     from .config import parse_checkpoint
@@ -102,7 +111,8 @@ def _cmd_reference(a) -> int:
 def _cmd_trace(a) -> int:
     from .engine import Engine
 
-    eng = Engine.load(a.checkpoint, max_seq_len=max(a.seq_len, 64), max_seqs=a.batch)
+    eng = Engine.load(a.checkpoint, max_seq_len=max(a.seq_len, 64), max_seqs=a.batch,
+                      mode_b_cache_bytes=a.mode_b_cache_mib << 20)
     ids = _input_ids(a, eng.cfg.vocab_size)
     if a.text:
         ids = torch.tensor([eng.tokenizer.encode(a.text).ids] * a.batch)
@@ -117,7 +127,7 @@ def _cmd_generate(a) -> int:
 
     from .engine import Engine
 
-    eng = Engine.load(a.checkpoint, max_seq_len=a.max_seq_len)
+    eng = Engine.load(a.checkpoint, max_seq_len=a.max_seq_len, mode_b_cache_bytes=a.mode_b_cache_mib << 20)
     if eng.tokenizer is None:
         raise SystemExit("no tokenizer.json next to the checkpoint")
     prompts = [eng.tokenizer.encode(p).ids for p in a.prompt]
@@ -133,38 +143,64 @@ def _cmd_generate(a) -> int:
 
 def _cmd_bench(a) -> int:
     """Prefill and decode throughput of the engine, with peak resident memory."""
+    import os
     import resource
     import time
 
     from .engine import Engine
+    from .engine.standard import StandardEngine
 
+    torch.set_num_threads(a.threads)
     torch.manual_seed(a.seed)
     t0 = time.perf_counter()
-    eng = Engine.load(a.checkpoint, max_seq_len=a.prompt_len + a.gen_len + 1, max_seqs=a.batch, max_tokens=a.batch * (a.prompt_len + a.gen_len + 64))
+    eng = Engine.load(a.checkpoint, max_seq_len=a.prompt_len + a.gen_len + 1, max_seqs=a.batch,
+                      max_tokens=a.batch * (a.prompt_len + a.gen_len + 64), mode_b_cache_bytes=a.mode_b_cache_mib << 20)
     t_load = time.perf_counter() - t0
-    cache = eng.new_cache()
-    seqs = [cache.new_sequence() for _ in range(a.batch)]
-    prompts = torch.randint(0, eng.cfg.vocab_size, (a.batch, a.prompt_len)).tolist()
-    t0 = time.perf_counter()
-    logits = eng.model.forward(list(zip(seqs, prompts)), cache)
-    t_pre = time.perf_counter() - t0
-    nxt = logits.argmax(-1).tolist()
-    t0 = time.perf_counter()
-    for _ in range(a.gen_len):
-        nxt = eng.model.forward([(q, [t]) for q, t in zip(seqs, nxt)], cache).argmax(-1).tolist()
-    t_dec = time.perf_counter() - t0
+    prompts = torch.randint(0, eng.cfg.vocab_size, (a.batch, a.prompt_len))
+    if isinstance(eng, StandardEngine):
+        t0 = time.perf_counter()
+        logits, _, cache = eng.model.forward(prompts)
+        t_pre = time.perf_counter() - t0
+        nxt = logits[:, -1].argmax(-1)
+        t0 = time.perf_counter()
+        for _ in range(a.gen_len):
+            logits, _, cache = eng.model.forward(nxt[:, None], cache)
+            nxt = logits[:, -1].argmax(-1)
+        t_dec = time.perf_counter() - t0
+        pages, store, backend = None, eng.model.store, "torch_standard"
+    else:
+        cache = eng.new_cache()
+        seqs = [cache.new_sequence() for _ in range(a.batch)]
+        t0 = time.perf_counter()
+        logits = eng.model.forward(list(zip(seqs, prompts.tolist())), cache)
+        t_pre = time.perf_counter() - t0
+        nxt = logits.argmax(-1).tolist()
+        t0 = time.perf_counter()
+        for _ in range(a.gen_len):
+            nxt = eng.model.forward([(q, [t]) for q, t in zip(seqs, nxt)], cache).argmax(-1).tolist()
+        t_dec = time.perf_counter() - t0
+        pages, store, backend = cache.pages_in_use, eng.model.w, "torch_ref"
+    peak_rss_bytes = _rss_bytes(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, sys.platform)
     res = {
         "checkpoint": a.checkpoint,
         "batch": a.batch,
         "prompt_len": a.prompt_len,
         "gen_len": a.gen_len,
         "threads": torch.get_num_threads(),
+        "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+        "mkl_dynamic": os.environ.get("MKL_DYNAMIC"),
         "load_s": round(t_load, 3),
         "prefill_tok_s": round(a.batch * a.prompt_len / t_pre, 2),
         "decode_tok_s": round(a.batch * a.gen_len / t_dec, 3) if a.gen_len else None,
-        "peak_rss_gb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6, 2),
-        "kv_pages_in_use": cache.pages_in_use,
-        "kernel_backend": "torch_ref",
+        "peak_rss_bytes": peak_rss_bytes,
+        "peak_rss_gib": round(peak_rss_bytes / (1 << 30), 4),
+        "kv_pages_in_use": pages,
+        "kernel_backend": backend,
+        "mode_b_cache_budget_bytes": store.mode_b_cache_bytes,
+        "mode_b_cache_used_bytes": store.mode_b_cache_used,
+        "mode_b_cache_hits": store.mode_b_cache_hits,
+        "mode_b_cache_misses": store.mode_b_cache_misses,
+        "mode_b_cache_evictions": store.mode_b_cache_evictions,
     }
     print(json.dumps(res, indent=2))
     return 0
@@ -254,6 +290,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--seed", type=int, default=0)
     s.add_argument("--text", help="trace this text instead of random token ids")
     s.add_argument("--decode-from", type=int, help="prefill this many tokens, then decode the rest one by one")
+    s.add_argument("--mode-b-cache-mib", type=int, default=256, help="maximum decoded Mode B bytes retained in the LRU (MiB)")
     s.set_defaults(fn=_cmd_trace)
 
     s = sub.add_parser("generate", help="generate text with the Boilerplate engine")
@@ -263,6 +300,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--temperature", type=float, default=0.0)
     s.add_argument("--seed", type=int)
     s.add_argument("--max-seq-len", type=int, default=4096)
+    s.add_argument("--mode-b-cache-mib", type=int, default=256, help="maximum decoded Mode B bytes retained in the LRU (MiB)")
     s.set_defaults(fn=_cmd_generate)
 
     s = sub.add_parser("bench", help="measure engine prefill/decode throughput and peak memory")
@@ -271,6 +309,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--gen-len", type=int, default=16)
     s.add_argument("--batch", type=int, default=1)
     s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--threads", type=int, default=4, help="PyTorch CPU math threads")
+    s.add_argument("--mode-b-cache-mib", type=int, default=256, help="maximum decoded Mode B bytes retained in the LRU (MiB)")
     s.set_defaults(fn=_cmd_bench)
 
     s = sub.add_parser("compare", help="compare two traces layer by layer")

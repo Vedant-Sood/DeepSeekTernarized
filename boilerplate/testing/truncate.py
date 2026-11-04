@@ -21,6 +21,7 @@ from __future__ import annotations
 import concurrent.futures as cf
 import copy
 import json
+import re
 import struct
 import urllib.request
 from pathlib import Path
@@ -31,6 +32,10 @@ from safetensors.torch import save_file
 from ..engine.weights import ST_DTYPES
 
 HUB = "https://huggingface.co/{repo}/resolve/{rev}/{file}"
+
+
+class RangeResponseError(IOError):
+    """The server did not return exactly the requested byte range."""
 
 
 def _remap(ids, keep: list[int]) -> list[int]:
@@ -100,19 +105,38 @@ class _Reader:
         self.local = Path(source).exists()
 
     def read(self, file: str, start: int, end: int) -> bytes:
+        if start < 0 or end < start:
+            raise ValueError("invalid byte range")
+        expected = end - start
+        if not expected:
+            return b""
         if self.local:
             with open(Path(self.source) / file, "rb") as f:
                 f.seek(start)
-                return f.read(end - start)
+                data = f.read(expected)
+            if len(data) != expected:
+                raise IOError(f"short read {len(data)} != {expected}")
+            return data
         url = HUB.format(repo=self.source, rev=self.revision, file=file)
         for attempt in range(5):
             try:
                 req = urllib.request.Request(url, headers={"Range": f"bytes={start}-{end - 1}"})
                 with urllib.request.urlopen(req, timeout=120) as r:
-                    data = r.read()
-                if len(data) != end - start:
-                    raise IOError(f"short read {len(data)} != {end - start}")
+                    content_range = r.headers.get("Content-Range", "")
+                    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+|\*)", content_range.strip(), re.IGNORECASE)
+                    if (r.status != 206 or match is None or int(match.group(1)) != start or
+                            int(match.group(2)) != end - 1 or
+                            (match.group(3) != "*" and int(match.group(3)) < end)):
+                        raise RangeResponseError(f"server did not honor byte range {start}-{end - 1}")
+                    length = r.headers.get("Content-Length")
+                    if length is not None and (not length.isdigit() or int(length) != expected):
+                        raise RangeResponseError("server returned an unexpected range length")
+                    data = r.read(expected + 1)
+                if len(data) != expected:
+                    raise IOError(f"short or oversized read {len(data)} != {expected}")
                 return data
+            except RangeResponseError:
+                raise
             except Exception:
                 if attempt == 4:
                     raise
