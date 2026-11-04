@@ -49,9 +49,14 @@ def main(argv=None) -> int:
     if a.max_windows:
         windows = min(windows, a.max_windows)
     first = a.ctx // 2
-    nll, count = 0.0, 0
+    nll, count, start, prior_s = 0.0, 0, 0, 0.0
+    if a.out and a.out.exists():  # resume a partial run with the same settings
+        prev = json.loads(a.out.read_text())
+        if prev.get("ctx") == a.ctx and prev.get("tokens_total") == len(ids) and prev.get("windows_done", 0) <= windows:
+            nll, count, start, prior_s = prev["nll_sum"], prev["scored_tokens"], prev["windows_done"], prev.get("eval_s", 0.0)
+            print(f"resuming after {start} windows", flush=True)
     t0 = time.perf_counter()
-    for w in range(windows):
+    for w in range(start, windows):
         chunk = torch.tensor([ids[w * a.ctx:(w + 1) * a.ctx]], dtype=torch.long)
         logits, _, _ = engine.model.forward(chunk)
         lp = F.log_softmax(logits[0, first:-1].float(), dim=-1)
@@ -59,7 +64,11 @@ def main(argv=None) -> int:
         nll -= float(lp.gather(-1, target[:, None]).sum())
         count += target.numel()
         print(f"window {w + 1}/{windows}: ppl so far {math.exp(nll / count):.4f}", flush=True)
-    eval_s = time.perf_counter() - t0
+        if a.out:
+            a.out.write_text(json.dumps({"ctx": a.ctx, "tokens_total": len(ids), "windows_done": w + 1,
+                                         "nll_sum": nll, "scored_tokens": count,
+                                         "eval_s": prior_s + time.perf_counter() - t0, "partial": True}))
+    eval_s = prior_s + time.perf_counter() - t0
     cpu = platform.processor()
     if Path("/proc/cpuinfo").exists():
         cpu = next((l.split(":", 1)[1].strip() for l in Path("/proc/cpuinfo").read_text().splitlines()
@@ -69,7 +78,7 @@ def main(argv=None) -> int:
         "checkpoint": str(a.checkpoint),
         "policy": json.loads(manifest.read_text())["policy"]["name"] if manifest.exists() else "source (Mode A)",
         "text_sha256": hashlib.sha256(text.encode()).hexdigest(), "tokens_total": len(ids),
-        "ctx": a.ctx, "windows": windows, "scored_tokens": count, "nll_sum": nll,
+        "ctx": a.ctx, "windows": windows, "windows_done": windows, "windows_available": len(ids) // a.ctx, "scored_tokens": count, "nll_sum": nll,
         "ppl": math.exp(nll / count), "compute_dtype": "float32", "ternary_backend": a.ternary_backend, "threads": torch.get_num_threads(),
         "cpu": cpu, "torch": torch.__version__, "load_s": round(load_s, 2), "eval_s": round(eval_s, 1),
     }
