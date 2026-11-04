@@ -15,6 +15,7 @@ throughput probe has been run.
 | Standard CPU decoder | `boilerplate/engine/standard.py`, `boilerplate/engine/engine.py`, `boilerplate/cli.py` | Config-driven Llama and OLMoE attention, normalization, RoPE, dense/MoE blocks, A/B/C linear loading, API dispatch and CPU benchmarking. |
 | Standard-decoder checks | `tests/test_standard_engine.py` | Tiny random Llama/OLMoE comparisons against Hugging Face, including greedy tokens, Mode B byte parity and a mixed B/C export. |
 | PTQ policies | `configs/policy/standard_*.yaml`, `boilerplate/format/policy.py`, `boilerplate/format/export.py`, `boilerplate/ternary/fit.py` | Absmean TQ1/TQ2 and residual TQ1 k=2, each with plain and GPTQ policy variants; exact size guard accounts for padding. |
+| Resumable evaluations | `scripts/eval/standard_perplexity.py`, `scripts/eval/standard_split_trace.py`, `tests/test_standard_perplexity.py`, `tests/test_standard_split_trace.py` | Checkpoint perplexity after each window and compare separately recorded per-prompt traces with checksums. |
 | llama.cpp baseline | External checkout `ggml-org/llama.cpp` at `149f5641b931aaf33697d70f9abc90c3e5300247` | Pinned source; CPU quantize, importance-matrix, perplexity and benchmark tools built. |
 
 These primitives are not yet a training pipeline or a complete Mode D model exporter. The
@@ -74,6 +75,13 @@ written safetensors headers; the whole-checkpoint row includes non-tensor files 
 | Router | 2,097,152 | 8,388,608 | 32.0000 | 32.0000 |
 | Normalization | 133,120 | 532,480 | 32.0000 | 32.0000 |
 | **Whole checkpoint** | **6,919,161,856** | **27,680,901,979** | **32.0049** | **32.0049** |
+
+A two-token, batch-1 Hugging Face load-and-forward smoke test of this native FP32 checkpoint
+completed in 57.863 s, with **34,119,249,920 bytes (31.7760 GiB)** peak RSS on the AMD EPYC
+9V74 CPU with four pinned threads and a 32 GiB container memory limit. This includes model load,
+does not compare the Boilerplate engine, and is not the requested 2,048-token/256-token memory
+benchmark. The per-prompt trace tooling avoids holding both model implementations in memory
+at once; the full 20-prompt comparison remains not run.
 
 The pinned SmolLM2 files were subsequently downloaded. `model.safetensors` is **723,674,912
 bytes by stat**, SHA-256 `7aaff6661428bed033abba9522bec81938678642cca3181fe752b6ca9e1e540f`,
@@ -196,6 +204,25 @@ from the manifest. GPTQ variants have not yet been calibrated or exported.
 | Normalization | 16.0000 | 16.0000 | 16.0000 | 16.0000 |
 | **Whole checkpoint** | **16.0474** | **3.6483** | **3.9961** | **5.1580** |
 
+A first-window diagnostic ran each plain PTQ arm and the source through the standard CPU
+engine, using the same fixed 2,048-token WikiText-2 window and its last 1,023 scored tokens.
+All four runs are shown below. These are **partial results for one of 148 windows**, not the
+full-test perplexity or the pre-registered QAT verdict. Peak RSS covers process startup, model
+loading and that prompt only; it does not include the requested 256-token decode. Hardware was
+the AMD EPYC 9V74 CPU (4-core quota), PyTorch 2.15 CPU, with four pinned math threads.
+
+| SmolLM2 engine arm | Source whole b/w | Arm whole b/w | First-window perplexity | Peak RSS bytes | Peak RSS GiB |
+|---|---:|---:|---:|---:|---:|
+| Source FP32 compute | 16.0474 | 16.0474 | 8.2918 | 3,668,361,216 | 3.4164 |
+| Absmean TQ1 k=1 | 16.0474 | 3.6483 | 3,831,412.2901 | 1,958,465,536 | 1.8240 |
+| Absmean TQ2 k=1 | 16.0474 | 3.9961 | 3,831,412.2901 | 2,034,495,488 | 1.8948 |
+| Residual TQ1 k=2 | 16.0474 | 5.1580 | 145,074.6775 | 1,971,236,864 | 1.8359 |
+
+The first-window source result is a diagnostic against llama.cpp's first-window BF16 GGUF
+value of 8.2976; these use different compute paths and are not bit-identical. The evaluation
+state for each arm records the input and checkpoint hashes and can resume the remaining
+windows. No result is omitted because its quality is poor.
+
 The theoretical size guard omitted row and scale-group padding. For a 64-column tiny-model
 FP4 expert, TQ1 k=2 actually uses 3.75 b/w, which is not below 0.85 × 4.25 = 3.6125 b/w. The
 exporter now checks the exact packed size. The default tiny checkpoint's expert intermediate
@@ -203,6 +230,10 @@ dimension changed from 64 to 128 so its k=2 example satisfies that rule; older t
 measurements in the previous reports used the original 64-column setting. No `allow_larger`
 override was used. The full development suite passed **157 tests**, with **11 CUDA tests
 skipped**, on the AMD CPU with two math threads.
+
+After adding the resumable evaluation scripts, the full suite passed **159 tests**, with
+**11 CUDA tests skipped**, under the same CPU and thread settings. The split-trace test also
+checks recovery after an interrupted file/metadata update and rejects non-finite comparisons.
 
 ## Experiment status
 
@@ -215,17 +246,18 @@ tests.
 |---|---|
 | Original source and BF16 comparison | SmolLM2 source size measured above; complete evaluations and OLMoE source conversion not yet performed |
 | llama.cpp Q8_0, Q4_K_M, Q3_K_M, Q2_K, IQ2_XS | SmolLM2 sizes and WikiText-2 perplexity measured above; OLMoE files and remaining evaluations not run |
-| Absmean TQ1 / TQ2, plain / GPTQ | SmolLM2 plain file sizes measured above; GPTQ and quality/speed evaluations not run |
-| Mode C TQ1 k=2, plain / GPTQ | SmolLM2 plain file size measured above; GPTQ and quality/speed evaluations not run |
+| Absmean TQ1 / TQ2, plain / GPTQ | SmolLM2 plain size and first-window diagnostic above; GPTQ and full quality/speed evaluations not run |
+| Mode C TQ1 k=2, plain / GPTQ | SmolLM2 plain size and first-window diagnostic above; GPTQ and full quality/speed evaluations not run |
 | SmolLM2 QAT shakedown | not run: GPU budget and throughput probe require owner approval |
 | OLMoE QAT at 1 B / 3 B / 10 B tokens, TQ1 / TQ2 | not run: multi-GPU hardware and training budget require owner approval |
 
 For every arm except the SmolLM2 and OLMoE source sizes and SmolLM2 GGUF/PTQ sizes reported
-above, file bytes and effective bits per weight are **not run**. For every arm, CPU RSS and GPU VRAM; batch-1 and
-batch-8 prefill/decode throughput on CPU and GPU; held-out pretraining-mix perplexity; MMLU,
-ARC-Challenge, HellaSwag, PIQA, WinoGrande and GSM8K; and OLMoE router overlap and expert-load
-entropy are **not run** for the reasons above. WikiText-2 perplexity for all other arms is
-**not run**.
+above, file bytes and effective bits per weight are **not run**. For every arm, the required
+2,048-token prompt plus 256-token decode CPU RSS and GPU VRAM; batch-1 and batch-8 prefill/decode
+throughput on CPU and GPU; held-out pretraining-mix perplexity; MMLU, ARC-Challenge, HellaSwag,
+PIQA, WinoGrande and GSM8K; and OLMoE router overlap and expert-load entropy are **not run**.
+Complete WikiText-2 perplexity for the other arms is **not run**; the plain ternary one-window
+diagnostics are reported above.
 
 The pre-registered verdict is **untested**: there is no OLMoE QAT run or evaluated conventional
 baseline to compare. In particular, the primitive tests do not establish model quality, file
