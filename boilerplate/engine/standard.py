@@ -26,7 +26,7 @@ def _value(weight):
 
 
 class _Linear:
-    def __init__(self, store: WeightStore, base: str, dtype: torch.dtype):
+    def __init__(self, store: WeightStore, base: str, dtype: torch.dtype, ternary_backend: str = "auto"):
         self.meta = store.mode_of(base)
         self.bias = store.maybe_ref(base + ".bias")
         self.ternary = None
@@ -34,7 +34,7 @@ class _Linear:
             terms = [PackedTerm(store.get(f"{base}.tq{i}.packed"), store.get(f"{base}.tq{i}.scale"))
                      for i in range(self.meta["terms"])]
             self.ternary = TernaryLinear(terms, self.meta["shape"][1], self.meta["packing"],
-                                         self.meta["group"], self.meta["act"])
+                                         self.meta["group"], self.meta["act"], backend=ternary_backend)
             self.linear = None
         else:
             self.linear = QLinear(store.ref(base + ".weight"), weight_dtype=dtype)
@@ -47,8 +47,11 @@ class _Linear:
 
 class StandardDecoder:
     def __init__(self, path: str | Path, *, dtype: torch.dtype = torch.float32,
-                 mode_b_cache_bytes: int = 256 << 20):
+                 mode_b_cache_bytes: int = 256 << 20, ternary_backend: str = "auto"):
+        """``ternary_backend``: "auto"/"cpp" run the C++ add/subtract kernel; "torch" multiplies the
+        int8-quantized activations by a cached FP32 dequantized weight (same values, BLAS speed)."""
         self.path = Path(path)
+        self.ternary_backend = ternary_backend
         self.config = json.loads((self.path / "config.json").read_text())
         c = self.config
         if c.get("model_type") not in ("llama", "olmoe"):
@@ -69,7 +72,7 @@ class StandardDecoder:
         head_name = "lm_head" if "lm_head.weight" in self.store or self.store.mode_of("lm_head")["mode"] in ("C", "D") else None
         if head_name is None and not c.get("tie_word_embeddings", False):
             raise ValueError("checkpoint lacks an LM head and does not declare tied embeddings")
-        self.head = _Linear(self.store, head_name, dtype) if head_name else None
+        self.head = _Linear(self.store, head_name, dtype, self.ternary_backend) if head_name else None
         self.final_norm = self.store.ref("model.norm.weight")
         self.layers = []
         for index in range(c["num_hidden_layers"]):
@@ -78,10 +81,10 @@ class StandardDecoder:
             layer = SimpleNamespace(
                 input_norm=self.store.ref(base + ".input_layernorm.weight"),
                 post_norm=self.store.ref(base + ".post_attention_layernorm.weight"),
-                q=_Linear(self.store, attn + ".q_proj", dtype),
-                k=_Linear(self.store, attn + ".k_proj", dtype),
-                v=_Linear(self.store, attn + ".v_proj", dtype),
-                o=_Linear(self.store, attn + ".o_proj", dtype),
+                q=_Linear(self.store, attn + ".q_proj", dtype, self.ternary_backend),
+                k=_Linear(self.store, attn + ".k_proj", dtype, self.ternary_backend),
+                v=_Linear(self.store, attn + ".v_proj", dtype, self.ternary_backend),
+                o=_Linear(self.store, attn + ".o_proj", dtype, self.ternary_backend),
                 q_norm=self.store.maybe_ref(attn + ".q_norm.weight"),
                 k_norm=self.store.maybe_ref(attn + ".k_norm.weight"),
                 prefix=base + ".mlp", experts={},
@@ -91,13 +94,13 @@ class StandardDecoder:
             if c["model_type"] == "llama":
                 layer.mlp = self._mlp(layer.prefix)
             else:
-                layer.router = _Linear(self.store, layer.prefix + ".gate", dtype)
+                layer.router = _Linear(self.store, layer.prefix + ".gate", dtype, self.ternary_backend)
             self.layers.append(layer)
 
     def _mlp(self, base):
-        return (_Linear(self.store, base + ".gate_proj", self.dtype),
-                _Linear(self.store, base + ".up_proj", self.dtype),
-                _Linear(self.store, base + ".down_proj", self.dtype))
+        return (_Linear(self.store, base + ".gate_proj", self.dtype, self.ternary_backend),
+                _Linear(self.store, base + ".up_proj", self.dtype, self.ternary_backend),
+                _Linear(self.store, base + ".down_proj", self.dtype, self.ternary_backend))
 
     def _norm(self, x, weight):
         xf = x.float()
@@ -203,9 +206,11 @@ class StandardEngine:
 
     @classmethod
     def load(cls, path: str | Path, *, dtype: torch.dtype = torch.float32, max_seq_len=4096,
-             mode_b_cache_bytes: int = 256 << 20, tokenizer_path=None, max_seqs=8, max_tokens=16384):
+             mode_b_cache_bytes: int = 256 << 20, tokenizer_path=None, max_seqs=8, max_tokens=16384,
+             ternary_backend: str = "auto"):
         from .engine import load_tokenizer
-        return cls(StandardDecoder(path, dtype=dtype, mode_b_cache_bytes=mode_b_cache_bytes),
+        return cls(StandardDecoder(path, dtype=dtype, mode_b_cache_bytes=mode_b_cache_bytes,
+                                   ternary_backend=ternary_backend),
                    load_tokenizer(tokenizer_path or path), max_seq_len=max_seq_len,
                    max_seqs=max_seqs, max_tokens=max_tokens)
 

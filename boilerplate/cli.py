@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 import torch
 
@@ -241,6 +242,18 @@ def _cmd_export(a) -> int:
     return 0
 
 
+def _cmd_gguf(a) -> int:
+    from .format.gguf_export import merge_into_base, write_ternary_only
+
+    if a.base:
+        info = merge_into_base(a.base, a.export_dir, a.out, a.packing)
+    else:
+        info = write_ternary_only(a.export_dir, a.out, a.packing)
+    print(json.dumps({"out": str(a.out), "bytes": Path(a.out).stat().st_size, "qtype": info["qtype"],
+                      "converted": len(info["converted"]), "skipped": info["skipped"]}, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="boilerplate")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -331,6 +344,13 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--calib-min-tokens", type=int, default=1,
                    help="GPTQ: weights that saw fewer calibration tokens use the plain fit (recorded in the manifest)")
     s.set_defaults(fn=_cmd_export)
+
+    s = sub.add_parser("gguf", help="write single-term ternary weights (k=1, group 256, fp16) as llama.cpp TQ1_0/TQ2_0")
+    s.add_argument("export_dir", help="a Boilerplate export of a llama/olmoe checkpoint")
+    s.add_argument("out", help="output .gguf")
+    s.add_argument("--base", help="llama.cpp BF16/F32 conversion of the same source; its other tensors and metadata are kept")
+    s.add_argument("--packing", choices=("tq1", "tq2"), default="tq1")
+    s.set_defaults(fn=_cmd_gguf)
 
     a = p.parse_args(argv)
     return a.fn(a)
