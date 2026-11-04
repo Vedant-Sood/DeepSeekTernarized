@@ -18,12 +18,13 @@ Modes B–D are compared against, so it is validated against the official DeepSe
 
 ## Step layout
 
-A step takes `(sequence, new tokens)` pairs. All tokens are flattened into one `[1, T, ...]` batch,
-so the embedding, every projection, the hyper-connection mixing, engram and the MoE run once over
-all `T` tokens. Attention is the only per-sequence part: each sequence attends over its own window
-ring and its own compressed-KV pages. A step can mix sequences that are prefilling (start 0, any
-length) with sequences that are decoding (one token each). Chunked prefill (start > 0 and several
-tokens) is not supported yet; the reference does not have it either.
+A step takes `(sequence, new tokens)` pairs. All tokens are flattened into one `[1, T, ...]` batch
+for the embedding, projections, engram and MoE. Attention uses each sequence's own window ring
+and compressed-KV pages. During generation the small FP32 hyper-connection products are also
+calculated per sequence so their reduction shape stays stable as batch composition changes;
+reference tracing keeps the reference's batched shape. A step can mix sequences that are
+prefilling (start 0, any length) with sequences that are decoding (one token each). Chunked
+prefill (start > 0 and several tokens) is not supported yet; the reference does not have it either.
 
 MoE is grouped by expert: router top-k over all tokens, then each selected expert runs once over
 all of its tokens, accumulating in FP32 in expert order (the reference's order, which keeps the
@@ -75,3 +76,13 @@ kernels' numerics in plain PyTorch. That is what lets the engine be compared bit
 reference running on the same kernels. It is a correctness backend: it dequantizes each weight per
 call and is not fast. The multiply-free ternary kernels (M2), the entropy-decode kernel (M3) and
 CUDA/AVX/NEON paths plug in behind the same `QLinear` interface.
+
+## Standard decoders
+
+`boilerplate/engine/standard.py` implements a CPU correctness path for Llama and OLMoE configs.
+It derives attention, RoPE, normalization and routing dimensions from the checkpoint, loads
+Mode A/B/C linears through the shared weight store and linear implementations, and uses a
+simple per-layer tensor KV cache. `Engine.load` dispatches by `model_type`; the CLI can trace,
+generate and benchmark these models. This path does not yet have paged KV, CUDA, or a complete
+Mode D exporter. Its FP32 SmolLM2 comparison and tiny OLMoE checks are in
+`docs/reports/small_model_ternary.md`.
