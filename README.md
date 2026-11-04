@@ -8,8 +8,9 @@ use ~1.6–2 bits/weight.
 
 Status: **M0** (skeleton, config parser, reference harness), **M1** (Mode A engine, bit-exact
 with the official reference) and **M2** (TQ1/TQ2 packing, CPU ternary kernel, Mode C with optional
-GPTQ) are implemented. **M3** has CPU Mode B, bit-exact with Mode A, and an on-demand decoded
-weight cache. A CUDA decoder prototype is present but has not been compiled or run on a GPU;
+GPTQ) are implemented. **M3** has CPU Mode B and an on-demand decoded weight cache. The current
+cache path is bit-exact with Mode A on tiny; the earlier CPU implementation also matched on the
+real slice. A CUDA decoder prototype is present but has not been compiled or run on a GPU;
 GPU engine integration and the real-slice memory acceptance check remain open. See `docs/reports/`,
 `docs/architecture/format.md` for the on-disk format,
 `docs/architecture/deepseek_v41_flash.md` for what the checkpoint contains and

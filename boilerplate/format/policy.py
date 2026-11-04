@@ -71,4 +71,8 @@ class Policy:
 
     def to_dict(self) -> dict:
         keep = ("match", "mode", "k", "group", "packing", "scale_dtype", "act", "gptq", "allow_larger")
-        return {"name": self.name, "rules": [{k: getattr(r, k) for k in keep} for r in self.rules]}
+        return {
+            "name": self.name,
+            "default": {k: getattr(self.default, k) for k in keep if k != "match"},
+            "rules": [{k: getattr(r, k) for k in keep} for r in self.rules],
+        }

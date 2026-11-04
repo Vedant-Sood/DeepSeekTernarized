@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from boilerplate.engine import Engine
 from boilerplate.engine.weights import WeightStore
@@ -47,6 +48,12 @@ def test_policy_rules_and_bits():
         Rule(match=".", mode="C", k=5)
     with pytest.raises(ValueError):
         Rule(match=".", mode="Z")
+    mixed = Policy.from_dict({"name": "roundtrip", "default": {"mode": "B"}, "rules": [
+        {"match": EXPERTS, "mode": "C", "k": 2, "packing": "tq1"}]})
+    restored = Policy.from_dict(mixed.to_dict())
+    assert restored.rule_for("layers.0.attn.wq_a").mode == "B"
+    assert restored.rule_for("layers.0.ffn.experts.0.w1").mode == "C"
+    assert restored.rule_for("layers.0.ffn.experts.0.w1").packing == "tq1"
 
 
 @needs_ext
@@ -99,12 +106,19 @@ def test_mixed_mode_b_c_export_and_run(tiny, ids, tmp_path):
     assert not policy.default.allow_larger and all(not rule.allow_larger for rule in policy.rules)
     mixed = export(tiny, tmp_path / "mixed", policy, log=lambda *a: None)
     c_only = export(tiny, tmp_path / "c_only", Policy.load(policy_dir / "experts_k2.yaml"), log=lambda *a: None)
-    meta = json.loads((mixed / "manifest.json").read_text())["tensors"]
+    manifest = json.loads((mixed / "manifest.json").read_text())
+    meta = manifest["tensors"]
     assert {entry["mode"] for entry in meta.values()} >= {"A", "B", "C"}
+    recorded_policy = Policy.from_dict(manifest["policy"])
+    assert recorded_policy.rule_for("layers.0.attn.wq_a").mode == "B"
+    assert recorded_policy.rule_for("layers.0.ffn.experts.0.w1").mode == "C"
     src, dst = WeightStore(tiny), WeightStore(mixed)
     coded_names = [name for entry in meta.values() if entry["mode"] == "B" for name in entry["coded"]]
     assert coded_names
-    for name in coded_names:
+    b_names = [f"{base}.{suffix}" for base, entry in meta.items() if entry["mode"] == "B"
+               for suffix in ("weight", "scale") if f"{base}.{suffix}" in src]
+    assert set(coded_names) <= set(b_names)
+    for name in b_names:
         assert torch.equal(src.get(name).view(torch.uint8), dst.get(name).view(torch.uint8)), name
 
     expected = Engine.load(c_only, max_seq_len=128).trace(ids, decode_from=13)
@@ -112,6 +126,18 @@ def test_mixed_mode_b_c_export_and_run(tiny, ids, tmp_path):
     comparison = compare_traces(expected, actual)
     assert all(layer.bit_exact for layer in comparison.layers), comparison.table()
     assert comparison.logits.bit_exact, comparison.table()
+
+
+def test_mode_b_keeps_wide_tensors_byte_identical(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text("{}")
+    weight = torch.randn(8, 16, generator=torch.Generator().manual_seed(19), dtype=torch.float32)
+    save_file({"linear.weight": weight}, str(source / "weights.safetensors"))
+    out = export(source, tmp_path / "encoded", Policy.from_dict({"default": {"mode": "B"}}), log=lambda *a: None)
+    meta = json.loads((out / "manifest.json").read_text())["tensors"]["linear"]
+    assert meta["mode"] == "B" and meta["coded"] == {}
+    assert torch.equal(WeightStore(out).get("linear.weight").view(torch.uint8), weight.view(torch.uint8))
 
 
 @pytest.mark.parametrize("engram", [False, True])

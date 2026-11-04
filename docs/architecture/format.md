@@ -100,7 +100,7 @@ alignment, but groups of 128 or 256 keep each group's inner loop a whole number 
 {
   "format": "boilerplate", "version": 1,
   "source": "...", "architecture": { ...source config.json... },
-  "policy": { "name": ..., "rules": [...] },
+  "policy": { "name": ..., "default": {"mode": ...}, "rules": [...] },
   "summary": {
     "params": ..., "bytes": ..., "bits_per_weight": ...,          // whole model, everything stored
     "by_mode": {"A": {"params", "bytes", "bits_per_weight"}, "C": {...}, "B": {...}}
