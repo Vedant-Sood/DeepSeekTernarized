@@ -32,7 +32,7 @@ boilerplate = "boilerplate.cli:main"
 include = ["boilerplate*"]
 
 [tool.setuptools.package-data]
-boilerplate = ["kernels/csrc/*.cpp"]
+boilerplate = ["kernels/csrc/*.cpp", "kernels/csrc/*.cu"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
