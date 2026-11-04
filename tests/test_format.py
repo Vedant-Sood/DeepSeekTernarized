@@ -1,6 +1,7 @@
 """M2/M3: policies, export, manifest, Mode B lossless coding and Mode C loading on the tiny checkpoint."""
 
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -89,6 +90,28 @@ def test_mode_b_bit_exact(tiny, ids, mode_a, tmp_path):
         assert torch.equal(src.get(n).view(torch.uint8), dst.get(n).view(torch.uint8)), n
     tr = Engine.load(out, max_seq_len=128).trace(ids)
     assert compare_traces(mode_a, tr).logits.bit_exact
+
+
+@needs_ext
+def test_mixed_mode_b_c_export_and_run(tiny, ids, tmp_path):
+    policy_dir = Path(__file__).resolve().parents[1] / "configs" / "policy"
+    policy = Policy.load(policy_dir / "experts_k2_lossless_rest.yaml")
+    assert not policy.default.allow_larger and all(not rule.allow_larger for rule in policy.rules)
+    mixed = export(tiny, tmp_path / "mixed", policy, log=lambda *a: None)
+    c_only = export(tiny, tmp_path / "c_only", Policy.load(policy_dir / "experts_k2.yaml"), log=lambda *a: None)
+    meta = json.loads((mixed / "manifest.json").read_text())["tensors"]
+    assert {entry["mode"] for entry in meta.values()} >= {"A", "B", "C"}
+    src, dst = WeightStore(tiny), WeightStore(mixed)
+    coded_names = [name for entry in meta.values() if entry["mode"] == "B" for name in entry["coded"]]
+    assert coded_names
+    for name in coded_names:
+        assert torch.equal(src.get(name).view(torch.uint8), dst.get(name).view(torch.uint8)), name
+
+    expected = Engine.load(c_only, max_seq_len=128).trace(ids, decode_from=13)
+    actual = Engine.load(mixed, max_seq_len=128).trace(ids, decode_from=13)
+    comparison = compare_traces(expected, actual)
+    assert all(layer.bit_exact for layer in comparison.layers), comparison.table()
+    assert comparison.logits.bit_exact, comparison.table()
 
 
 @pytest.mark.parametrize("engram", [False, True])

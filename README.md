@@ -7,12 +7,13 @@ use ~1.6–2 bits/weight.
 ## What works today
 
 Status: **M0** (skeleton, config parser, reference harness), **M1** (Mode A engine, bit-exact
-with the official reference), **M2** (TQ1/TQ2 packing, CPU ternary kernel, Mode C with optional
-GPTQ) and **M3** (Mode B, bit-exact with Mode A, on CPU) are done. See `docs/reports/`,
+with the official reference) and **M2** (TQ1/TQ2 packing, CPU ternary kernel, Mode C with optional
+GPTQ) are implemented. **M3** has CPU Mode B, bit-exact with Mode A; bounded decoding and GPU
+support remain open. See `docs/reports/`,
 `docs/architecture/format.md` for the on-disk format,
 `docs/architecture/deepseek_v41_flash.md` for what the checkpoint contains and
 `docs/architecture/engine.md` for the engine design.
-* **Mode A only.** The engine runs the checkpoint in its shipped formats (FP8 linears, FP4 routed
+* **Mode A.** The engine runs the checkpoint in its shipped formats (FP8 linears, FP4 routed
   experts, BF16/FP32 small tensors). Its kernels (`boilerplate/kernels/torch_ref.py`) are a
   correctness backend: they dequantize each weight and run a floating-point GEMM. They are slow
   (0.067 tok/s decode on a 7-layer real-weight slice on 4 CPU cores).
@@ -20,12 +21,15 @@ GPTQ) and **M3** (Mode B, bit-exact with Mode A, on CPU) are done. See `docs/rep
   PyTorch kernels, on a tiny random-init model and on a 7-of-40-layer, 16-of-384-expert slice of
   the real weights without engram. That validates the engine around the kernels, not the full
   model's quality. See `docs/reports/M1.md` for the exact scope.
-* No ternary code exists yet: TQ1/TQ2 packing, ternary kernels, Mode C, Mode B and QAT are planned.
+* **Mode B** losslessly encodes supported weights on disk and decodes them to the original bytes.
+  It currently retains decoded tensors, so it is not yet a bounded-memory runtime.
+* **Mode C** exports and runs stacked ternary weights with TQ1/TQ2 packing, CPU kernels and
+  optional GPTQ. A mixed Mode B + C policy is available. Mode D QAT is not implemented.
 
-## Planned weight modes
+## Weight modes
 
 **A** baseline (original FP8/FP4), **B** lossless entropy-coded, **C** stacked residual ternary,
-**D** QAT-trained single ternary. Packing: TQ2 (2 bits/weight) and TQ1 (5 trits/byte, 1.6
+**D** QAT-trained single ternary (planned). Packing: TQ2 (2 bits/weight) and TQ1 (5 trits/byte, 1.6
 bits/weight), each plus an FP16 scale per 128 weights (1.725 / 2.125 bits/weight).
 
 What ternary can save here is limited by the source: the routed experts are already FP4 (4.25
@@ -63,6 +67,7 @@ boilerplate make-truncated deepseek-ai/DeepSeek-V4.1-Flash-1017 ./trunc7
 # Export under a precision policy: Mode C (ternary experts), Mode B (lossless), mixed
 boilerplate export ./trunc7 ./trunc7_k2 --policy configs/policy/experts_k2.yaml
 boilerplate export ./trunc7 ./trunc7_lossless --policy configs/policy/lossless.yaml
+boilerplate export ./trunc7 ./trunc7_mixed --policy configs/policy/experts_k2_lossless_rest.yaml
 # GPTQ rules (gptq: true) need calibration text
 boilerplate export ./trunc7 ./trunc7_gptq --policy my_gptq.yaml --calib-text wiki_train.txt --calib-seqs 512
 
