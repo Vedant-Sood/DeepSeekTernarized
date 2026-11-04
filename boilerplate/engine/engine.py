@@ -112,7 +112,7 @@ class Engine:
         out: list[list[int]] = [[] for _ in prompts]
         done = [False] * len(prompts)
         try:
-            logits = self.model.forward(list(zip(seqs, prompts)), cache)
+            logits = self.model.forward(list(zip(seqs, prompts)), cache, stable_sequence_hc=True)
             for step in range(max_new_tokens):
                 nxt = sample(logits, temperature, gen).tolist()
                 active = [i for i in range(len(prompts)) if not done[i]]
@@ -125,7 +125,7 @@ class Engine:
                 active = [i for i in active if not done[i]]
                 if not active or step == max_new_tokens - 1:
                     break
-                logits = self.model.forward([(seqs[i], [out[i][-1]]) for i in active], cache)
+                logits = self.model.forward([(seqs[i], [out[i][-1]]) for i in active], cache, stable_sequence_hc=True)
         finally:
             for q in seqs:
                 cache.free(q)

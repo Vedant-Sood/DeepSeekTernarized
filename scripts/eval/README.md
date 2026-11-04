@@ -10,6 +10,8 @@ These are the scripts as they were run, with the paths used in the development c
 | `engram_sample.py`, `engram_eval.py` | real engram rows via HTTP range requests; ternary error and Mode B gain |
 | `modeb_measure.py CKPT` | Mode B on every tensor: exact round trip, ratio per role/dtype, codec throughput |
 | `modeb_validate.py SOURCE MODE_B` | Exact Mode A/Mode B trace bytes over a prefill and decode, with configurable decoded-cache budgets |
+| `reference_trace_rss.py BACKEND CKPT IDS TRACE` | Measure official-reference or Mode A load and trace peak RSS in a separate process |
+| `compare_trace_bytes.py REF CAND` | Compare input, layer and logit bytes from saved traces |
 | `fullsize.py` | per-role params and bytes of the full release from its shard headers |
 
 For a **local 7-layer slice** and a fresh output directory, activate the project virtualenv and
@@ -27,5 +29,5 @@ python scripts/eval/modeb_validate.py "$SLICE" "$SLICE_MODE_B" --tokens 256 --de
 `modeb_validate.py` exits nonzero unless every layer and logits have identical bytes for each
 budget. It generates seeded token IDs by default; `--input-ids FILE.safetensors` uses the file's
 `input_ids` tensor instead. It does not measure the process peak RSS; use the separate `bench`
-processes above for that comparison. These commands have not been run on the real slice in the
-current environment.
+processes above for that comparison. Real-slice results and exact workload details are in the
+2026-11-04 follow-up in `docs/reports/M3.md`.

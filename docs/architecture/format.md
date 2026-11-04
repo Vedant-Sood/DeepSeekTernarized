@@ -74,6 +74,8 @@ For a weight with base name `X`:
   in row chunks. The decoded-byte LRU is controlled by `mode_b_cache_bytes` in `Engine.load` or
   `--mode-b-cache-mib` in the CLI. It bounds retained cache entries, not temporary decode
   buffers, PyTorch's separate FP32 dequantization cache, file-backed mmap pages, or process RSS.
+  The CPU engine aligns FP32 hyper-connection matrices as in the official reference, since
+  BLAS may choose a different reduction order for differently aligned checkpoint layouts.
   An optional CUDA Huffman decoder source can write decoded bytes into a reusable GPU buffer;
   it has not yet been compiled or validated on a GPU or integrated into the engine's GEMM path.
 * **Mode C**: for each term `i` in `0..k-1`:

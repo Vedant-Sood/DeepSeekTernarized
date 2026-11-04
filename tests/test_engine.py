@@ -12,12 +12,33 @@ import pytest
 import torch
 
 from boilerplate.engine import Engine, KVCache
+from boilerplate.engine.model import _match_alignment
 from boilerplate.engine.engram import EngramHasher, EngramLayout, compressed_token_map, is_prime
 from boilerplate.reference import compare_traces
 from boilerplate.reference.official_backend import OfficialReference, load_hf_tokenizer
 from boilerplate.testing.tiny import tiny_tokenizer, write_tiny_checkpoint
 
 REF_CODE = Path(__file__).resolve().parents[1] / "third_party" / "deepseek_v41_inference"
+
+
+def test_hc_matrix_can_match_reference_alignment():
+    """Identical mapped weights can start at different addresses in different exports."""
+    generator = torch.Generator().manual_seed(42)
+    reference = torch.randn(24, 512, generator=generator)
+    x = torch.randn(1, 1, 512, generator=generator)
+    storage = torch.empty(reference.numel() + 32, dtype=torch.float32)
+    other_storage = torch.empty(reference.numel() + 32, dtype=torch.float32)
+    for alignment in (0, 8, 24, 56):
+        offset = next(i for i in range(16) if (storage.data_ptr() + 4 * i) % 64 == alignment)
+        source = storage[offset:offset + reference.numel()].view_as(reference)
+        source.copy_(reference)
+        other_offset = next(i for i in range(16) if (other_storage.data_ptr() + 4 * i) % 64 == (alignment + 4) % 64)
+        other = other_storage[other_offset:other_offset + reference.numel()].view_as(reference)
+        other.copy_(reference)
+        copied = _match_alignment(other, alignment)
+        assert copied.data_ptr() % 64 == alignment
+        assert torch.equal(copied, reference)
+        assert torch.equal(torch.nn.functional.linear(x, source), torch.nn.functional.linear(x, copied))
 
 
 def _need_reference_deps():
@@ -33,6 +54,12 @@ def tiny(tmp_path_factory):
 @pytest.fixture(scope="module")
 def engine(tiny):
     return Engine.load(tiny, max_seq_len=256)
+
+
+def test_engine_aligns_hc_matrices_for_reference(engine):
+    for layer in engine.model.layers:
+        for fn, _, _ in layer.hc.values():
+            assert fn.data_ptr() % 64 == 0
 
 
 @pytest.fixture(scope="module")

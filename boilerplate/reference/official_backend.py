@@ -136,7 +136,13 @@ def convert_checkpoint(code_dir: Path, hf_ckpt: Path, out_dir: Path, expert_dtyp
     spec = importlib.util.spec_from_file_location("ds_ref_convert", code_dir / "convert.py")
     conv = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(conv)
-    conv.main(str(hf_ckpt), str(out_dir), 1, expert_dtype)
+    # The vendored converter changes PyTorch's process-wide thread count. Restore the caller's
+    # pinned setting before any reference or engine comparison, including on failure.
+    threads = torch.get_num_threads()
+    try:
+        conv.main(str(hf_ckpt), str(out_dir), 1, expert_dtype)
+    finally:
+        torch.set_num_threads(threads)
     return target
 
 
