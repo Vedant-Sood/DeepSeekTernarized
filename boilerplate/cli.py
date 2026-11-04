@@ -234,7 +234,7 @@ def _cmd_export(a) -> int:
         if not seqs:
             raise SystemExit(f"calibration text is shorter than --calib-len {a.calib_len} tokens")
         layers = {int(x) for x in a.calib_layers.split(",")} if a.calib_layers else None
-        hessians = calibrate(eng, seqs, pol, layers)
+        hessians = calibrate(eng, seqs, pol, layers, min_tokens=a.calib_min_tokens)
     out = export(a.source, a.out_dir, pol, hessians=hessians, shard_bytes=int(a.shard_gb * 2**30))
     s = json.loads((out / "manifest.json").read_text())["summary"]
     print(json.dumps(s, indent=2))
@@ -328,6 +328,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--calib-seqs", type=int, default=512, help="GPTQ: number of calibration sequences")
     s.add_argument("--calib-len", type=int, default=512, help="GPTQ: tokens per calibration sequence")
     s.add_argument("--calib-layers", help="GPTQ: only calibrate these layer ids (comma-separated)")
+    s.add_argument("--calib-min-tokens", type=int, default=1,
+                   help="GPTQ: weights that saw fewer calibration tokens use the plain fit (recorded in the manifest)")
     s.set_defaults(fn=_cmd_export)
 
     a = p.parse_args(argv)

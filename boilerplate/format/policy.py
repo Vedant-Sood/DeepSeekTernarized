@@ -27,6 +27,7 @@ class Rule:
     scale_dtype: str = "fp16"
     act: str = "int8"
     gptq: bool = False
+    fit: str = "lsq"  # "lsq": least-squares greedy residual fit; "absmean": BitNet b1.58 quantizer (k = 1)
     allow_larger: bool = False  # permit Mode C settings that do not shrink the source (experiments)
 
     def effective_bits(self) -> float:
@@ -46,6 +47,10 @@ class Rule:
                 raise ValueError(f"scale_dtype {self.scale_dtype!r}")
             if self.act not in ("int8", "bf16"):
                 raise ValueError(f"act {self.act!r}")
+            if self.fit not in ("lsq", "absmean"):
+                raise ValueError(f"fit {self.fit!r}: expected lsq or absmean")
+            if self.fit == "absmean" and (self.k != 1 or self.gptq):
+                raise ValueError("fit: absmean is the single-term BitNet quantizer; it needs k = 1 and no gptq")
 
 
 @dataclass
@@ -70,7 +75,7 @@ class Policy:
         return cls.from_dict(yaml.safe_load(Path(path).read_text()))
 
     def to_dict(self) -> dict:
-        keep = ("match", "mode", "k", "group", "packing", "scale_dtype", "act", "gptq", "allow_larger")
+        keep = ("match", "mode", "k", "group", "packing", "scale_dtype", "act", "gptq", "fit", "allow_larger")
         return {
             "name": self.name,
             "default": {k: getattr(self.default, k) for k in keep if k != "match"},

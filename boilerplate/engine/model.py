@@ -75,7 +75,15 @@ def _tensor(value):
 
 
 def _match_alignment(value: torch.Tensor, target: int | None, alignment: int = 64) -> torch.Tensor:
-    """Match a CPU matrix's address alignment without changing its values."""
+    """Match a CPU matrix's address alignment without changing its values.
+
+    This is a reference-parity workaround, not a correctness requirement. Some CPU BLAS builds
+    (seen with MKL on AMD EPYC) choose a different FP32 reduction order for an operand whose
+    address is not 64-byte aligned, so an mmap'd matrix and the official reference's aligned copy
+    give results that differ in the last bits. Copying into aligned storage restores byte-identical
+    traces. It is tied to the BLAS build and CPU: if bit-exact comparisons start failing on a new
+    host, check alignment here first. GPU paths and tolerance-based comparisons do not need it.
+    """
     if target is None or value.device.type != "cpu":
         return value
     if target < 0 or target >= alignment or target % value.element_size():

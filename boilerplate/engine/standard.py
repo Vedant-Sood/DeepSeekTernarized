@@ -38,6 +38,7 @@ class _Linear:
             self.linear = None
         else:
             self.linear = QLinear(store.ref(base + ".weight"), weight_dtype=dtype)
+            self.linear.name = base  # GPTQ calibration looks inputs up by weight base name
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         y = self.ternary(x, out_dtype=x.dtype) if self.ternary is not None else self.linear(x)
@@ -119,11 +120,13 @@ class StandardDecoder:
         gate, up, down = mlp
         return down(F.silu(gate(x)) * up(x))
 
-    def _moe(self, layer, x):
+    def _moe(self, layer, x, routing: list | None = None):
         shape = x.shape
         flat = x.reshape(-1, self.hidden)
         scores = torch.softmax(layer.router(flat).float(), dim=-1)
         values, indices = torch.topk(scores, self.config["num_experts_per_tok"], dim=-1)
+        if routing is not None:
+            routing.append(indices)
         if self.config.get("norm_topk_prob", False):
             values = values / values.sum(-1, keepdim=True)
         values = values.to(x.dtype)
@@ -139,7 +142,10 @@ class StandardDecoder:
         return output.view(shape)
 
     @torch.inference_mode()
-    def forward(self, ids: torch.Tensor, past=None, *, capture_layers: list | None = None):
+    def forward(self, ids: torch.Tensor, past=None, *, capture_layers: list | None = None,
+                capture_routing: list | None = None):
+        """ids [batch, seq] continuing ``past``. ``capture_routing`` (MoE only) receives one entry
+        per layer: the selected experts [batch * seq, top_k] for this step's tokens."""
         if ids.ndim != 2 or ids.device.type != "cpu" or ids.shape[1] == 0:
             raise ValueError("input IDs must be a nonempty CPU [batch, sequence] tensor")
         past = [None] * len(self.layers) if past is None else past
@@ -176,7 +182,7 @@ class StandardDecoder:
             x = residual + layer.o(attention.transpose(1, 2).reshape(b, s, -1).contiguous())
             residual = x
             z = self._norm(x, layer.post_norm)
-            x = residual + (self._run_mlp(layer.mlp, z) if self.config["model_type"] == "llama" else self._moe(layer, z))
+            x = residual + (self._run_mlp(layer.mlp, z) if self.config["model_type"] == "llama" else self._moe(layer, z, capture_routing))
             if capture_layers is not None:
                 capture_layers.append(x)
             states.append(x)
@@ -230,23 +236,30 @@ class StandardEngine:
         eos = self.cfg.eos_token_id
         eos_token_ids = eos_token_ids if eos_token_ids is not None else (set(eos) if isinstance(eos, list) else {eos} if eos is not None else set())
         generator = torch.Generator().manual_seed(seed) if seed is not None else None
-        results, finished = [], []
+        results, finished = [[] for _ in prompts], [False] * len(prompts)
+        # Prompts of equal length share one batched forward (one KV offset per batch); different
+        # lengths run as separate groups. Finished rows keep stepping but their tokens are dropped.
+        groups: dict[int, list[int]] = {}
         for index, prompt in enumerate(prompts):
-            tokens, done, past = [], False, None
-            if max_new_tokens:
-                logits, _, past = self.model.forward(torch.tensor([prompt], dtype=torch.long))
-                for step in range(max_new_tokens):
-                    token = int(sample(logits[:, -1], temperature, generator).item())
-                    tokens.append(token)
+            groups.setdefault(len(prompt), []).append(index)
+        for rows in groups.values():
+            if not max_new_tokens:
+                continue
+            logits, _, past = self.model.forward(torch.tensor([prompts[i] for i in rows], dtype=torch.long))
+            active = list(range(len(rows)))
+            for step in range(max_new_tokens):
+                chosen = sample(logits[:, -1], temperature, generator).tolist()
+                for r in list(active):
+                    index, token = rows[r], int(chosen[r])
+                    results[index].append(token)
                     if stream is not None:
                         stream(index, token)
                     if token in eos_token_ids:
-                        done = True
-                        break
-                    if step + 1 < max_new_tokens:
-                        logits, _, past = self.model.forward(torch.tensor([[token]]), past)
-            results.append(tokens)
-            finished.append(done)
+                        finished[index] = True
+                        active.remove(r)
+                if not active or step + 1 == max_new_tokens:
+                    break
+                logits, _, past = self.model.forward(torch.tensor(chosen, dtype=torch.long)[:, None], past)
         return GenerationResult(results, finished)
 
     def generate_text(self, prompt: str, **kwargs) -> str:

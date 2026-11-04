@@ -15,9 +15,11 @@ weight error. Scales for a group are fitted when the sweep enters it.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 
 from .pack import pack, unpack
 
@@ -51,6 +53,28 @@ def fit_term(r: torch.Tensor, group: int, scale_dtype=torch.float16) -> TernaryT
     trits = (torch.sign(rg) * keep).to(torch.int8).view(N, -1)[:, :K]
     # an all-zero group gets scale 0; keep it finite and its trits zero
     return TernaryTerm(trits, scale)
+
+
+@torch.no_grad()
+def absmean_ternary(weight: torch.Tensor, group: int, scale_dtype: torch.dtype = torch.float16) -> TernaryTerm:
+    """BitNet b1.58 absmean quantizer: trits = clamp(round(W / s), -1, 1) with s = mean |W| per row
+    and group. Used by QAT (``boilerplate.qat.BitLinear``) and by the Mode C ``fit: absmean`` PTQ arm.
+    Unlike ``fit_term`` it does not minimize the weight error; it matches what QAT trains against."""
+    if weight.ndim != 2 or group <= 0 or weight.size(1) == 0:
+        raise ValueError("weight must be a matrix with a nonempty input dimension and positive group")
+    if scale_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("scale_dtype must be float16 or bfloat16")
+    rows, columns = weight.shape
+    groups = math.ceil(columns / group)
+    data = F.pad(weight.float(), (0, groups * group - columns)).view(rows, groups, group)
+    counts = torch.full((groups,), group, dtype=torch.float32, device=weight.device)
+    counts[-1] = columns - (groups - 1) * group
+    # Round the scale to the stored format before quantizing, so training uses precisely the
+    # same scale that the engine will read after export.
+    scale = (data.abs().sum(-1) / counts).to(scale_dtype)
+    scale_f32 = scale.float().unsqueeze(-1)
+    trits = torch.where(scale_f32 > 0, torch.round(data / scale_f32.clamp_min(1e-30)).clamp(-1, 1), 0)
+    return TernaryTerm(trits.to(torch.int8).view(rows, -1)[:, :columns].contiguous(), scale)
 
 
 def dequant_terms(terms: list[TernaryTerm], K: int, group: int) -> torch.Tensor:
