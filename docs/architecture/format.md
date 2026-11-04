@@ -67,6 +67,12 @@ For a weight with base name `X`:
   MSB-first, at most 12 bits long, and come in blocks of 4096 symbols. Each block decodes
   independently with one 4096-entry table of `(symbol << 8) | length`, indexed by the next 12 bits.
   4-byte tensors are stored as in Mode A.
+
+  The CPU engine decodes coded linears on demand. Embeddings and engram tables are decoded by
+  the independent Huffman blocks covering requested rows; the language-model head is decoded
+  in row chunks. The decoded-byte LRU is controlled by `mode_b_cache_bytes` in `Engine.load` or
+  `--mode-b-cache-mib` in the CLI. It bounds retained cache entries, not temporary decode
+  buffers, PyTorch's separate FP32 dequantization cache, file-backed mmap pages, or process RSS.
 * **Mode C**: for each term `i` in `0..k-1`:
   - `X.tq{i}.packed` uint8 `[N, ceil(K / per_byte)]`: the trits, row-major, with the reduction dim
     K contiguous;
