@@ -1,0 +1,11 @@
+name: standard-absmean-tq1-gptq
+default: {mode: A}
+rules:
+  - match: '^model\.layers\.\d+\.(self_attn\.(q_proj|k_proj|v_proj|o_proj)|mlp\.(gate_proj|up_proj|down_proj|experts\.\d+\.(gate_proj|up_proj|down_proj)))$'
+    mode: C
+    k: 1
+    group: 128
+    packing: tq1
+    quantizer: absmean
+    act: int8
+    gptq: true

@@ -31,7 +31,7 @@ from safetensors.torch import save_file
 
 from ..checkpoint.dequant import dequant_fp4, dequant_fp8_block, is_packed_fp4
 from ..engine.weights import WeightStore
-from ..ternary.fit import fit_gptq, fit_residual
+from ..ternary.fit import absmean_ternary, fit_gptq, fit_residual
 from ..ternary.pack import pack
 from . import entropy
 from .policy import MAX_RATIO, Policy
@@ -170,9 +170,10 @@ def export(
                 "source_dtype": "fp4_e2m1" if fp4 else str(w.dtype).replace("torch.", "")}
         if rule.mode == "C" and w.ndim == 2:
             src_bits = 8 * sum(ws.get(n).numel() * ws.get(n).element_size() for n in tnames) / params
-            if rule.effective_bits() >= MAX_RATIO * src_bits and not rule.allow_larger:
+            effective_bits = rule.effective_bits(meta["shape"][1])
+            if effective_bits >= MAX_RATIO * src_bits and not rule.allow_larger:
                 raise ValueError(
-                    f"{base}: Mode C {rule.packing} k={rule.k} group={rule.group} is {rule.effective_bits():.3f} bits/weight, "
+                    f"{base}: Mode C {rule.packing} k={rule.k} group={rule.group} is {effective_bits:.3f} bits/weight, "
                     f"not below {MAX_RATIO} x the source's {src_bits:.3f}; lower k, use tq1, or set allow_larger"
                 )
             meta["source_bits"] = src_bits
@@ -180,14 +181,18 @@ def export(
             if rule.gptq:
                 if not hessians or base not in hessians:
                     raise ValueError(f"{base}: gptq requested but no calibration Hessian")
-                terms = fit_gptq(W, hessians[base], rule.k, rule.group, scale_dtype=SCALE_DTYPES[rule.scale_dtype])
+                terms = fit_gptq(W, hessians[base], rule.k, rule.group, scale_dtype=SCALE_DTYPES[rule.scale_dtype],
+                                 quantizer=rule.quantizer)
+            elif rule.quantizer == "absmean":
+                terms = [absmean_ternary(W, rule.group, SCALE_DTYPES[rule.scale_dtype])]
             else:
                 terms = fit_residual(W, rule.k, rule.group, SCALE_DTYPES[rule.scale_dtype])
             stored = {}
             for i, t in enumerate(terms):
                 stored[f"{base}.tq{i}.packed"] = pack(t.trits, rule.packing)
                 stored[f"{base}.tq{i}.scale"] = t.scale
-            meta.update(packing=rule.packing, terms=rule.k, group=rule.group, scale_dtype=rule.scale_dtype, act=rule.act, gptq=rule.gptq)
+            meta.update(packing=rule.packing, terms=rule.k, group=rule.group, scale_dtype=rule.scale_dtype,
+                        act=rule.act, gptq=rule.gptq, quantizer=rule.quantizer)
             record(base, meta, stored, params)
         elif rule.mode == "B":
             stored, parts_meta = encode_lossless(tnames)

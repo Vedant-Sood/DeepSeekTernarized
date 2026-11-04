@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from boilerplate.kernels.cpu import ext
-from boilerplate.ternary.fit import dequant_terms, fit_gptq, fit_residual, fit_term, roundtrip_check
+from boilerplate.ternary.fit import absmean_ternary, dequant_terms, fit_gptq, fit_residual, fit_term, roundtrip_check
 from boilerplate.ternary.ops import PackedTerm, TernaryLinear, quant_act_int8
 from boilerplate.ternary.pack import bits_per_weight, pack, packed_cols, unpack
 
@@ -65,6 +65,14 @@ def test_gptq_lowers_output_error():
     e_plain = (x @ (w - plain).T).square().mean()
     e_gptq = (x @ (w - gq).T).square().mean()
     assert e_gptq < 0.9 * e_plain
+
+
+def test_gptq_absmean_with_identity_hessian_matches_plain():
+    weight = torch.randn(4, 19, generator=torch.Generator().manual_seed(54))
+    expected = absmean_ternary(weight, 8)
+    actual = fit_gptq(weight, torch.eye(19), 1, group=8, quantizer="absmean")[0]
+    assert torch.equal(actual.trits, expected.trits)
+    assert torch.equal(actual.scale, expected.scale)
 
 
 def test_int8_activation_quant():
