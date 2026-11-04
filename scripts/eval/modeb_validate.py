@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 
@@ -35,6 +36,7 @@ def main(argv=None) -> int:
     os.environ["OMP_NUM_THREADS"] = str(args.threads)
     os.environ["MKL_NUM_THREADS"] = str(args.threads)
     os.environ["MKL_DYNAMIC"] = "FALSE"
+    os.environ["OMP_DYNAMIC"] = "FALSE"
 
     import torch
     from safetensors.torch import load_file
@@ -66,11 +68,13 @@ def main(argv=None) -> int:
         return Engine.load(path, max_seq_len=args.tokens + 8, max_seqs=ids.shape[0],
                            max_tokens=ids.shape[0] * (args.tokens + 64), mode_b_cache_bytes=budget)
 
+    print("Tracing the Mode A source...", file=sys.stderr, flush=True)
     baseline_engine = load(args.source, 0)
     baseline = baseline_engine.trace(ids, decode_from=args.decode_from)
     del baseline_engine
     results = []
     for budget in args.budgets_mib:
+        print(f"Tracing Mode B with a {budget} MiB decoded-cache budget...", file=sys.stderr, flush=True)
         engine = load(args.mode_b, budget << 20)
         candidate = engine.trace(ids, decode_from=args.decode_from)
         if len(baseline.hidden_states) != len(candidate.hidden_states):
@@ -86,6 +90,7 @@ def main(argv=None) -> int:
             "layer_bytes_identical": layer_equal,
             "logits_bytes_identical": logits_equal,
         })
+        print(f"Completed {budget} MiB: layers={layer_equal}, logits={logits_equal}", file=sys.stderr, flush=True)
         del engine, candidate
     print(json.dumps({
         "source": str(args.source), "mode_b": str(args.mode_b), "batch": ids.shape[0],
@@ -93,7 +98,8 @@ def main(argv=None) -> int:
         "input_ids": str(args.input_ids) if args.input_ids else None,
         "seed": None if args.input_ids else args.seed, "torch": torch.__version__,
         "threads": torch.get_num_threads(), "omp_num_threads": os.environ["OMP_NUM_THREADS"],
-        "mkl_dynamic": os.environ["MKL_DYNAMIC"], "results": results,
+        "mkl_num_threads": os.environ["MKL_NUM_THREADS"], "mkl_dynamic": os.environ["MKL_DYNAMIC"],
+        "omp_dynamic": os.environ["OMP_DYNAMIC"], "results": results,
     }, indent=2))
     return 0 if all(r["logits_bytes_identical"] and all(r["layer_bytes_identical"]) for r in results) else 1
 

@@ -9,7 +9,7 @@ import torch
 from boilerplate.checkpoint import CheckpointSource
 from boilerplate.config import parse_checkpoint
 from boilerplate.reference import ReferenceTrace, compare_traces
-from boilerplate.reference.official_backend import OfficialReference, hf_config_to_model_args
+from boilerplate.reference.official_backend import OfficialReference, convert_checkpoint, hf_config_to_model_args
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -202,3 +202,20 @@ def test_official_backend_with_cpu_kernel_shim(tmp_path):
     assert "kernel" not in sys.modules and "model" not in sys.modules  # no leakage
     assert torch.get_default_dtype() == torch.float32
     assert torch.allclose(t.logits[0, -1], ref.trace(ids).logits[0, -1])
+
+
+def test_reference_conversion_restores_caller_thread_count(tmp_path):
+    code = tmp_path / "code"
+    code.mkdir()
+    (code / "convert.py").write_text(
+        "import torch\n"
+        "def main(*args):\n"
+        "    torch.set_num_threads(1)\n"
+    )
+    previous = torch.get_num_threads()
+    try:
+        torch.set_num_threads(2)
+        convert_checkpoint(code, tmp_path / "source", tmp_path / "out", None)
+        assert torch.get_num_threads() == 2
+    finally:
+        torch.set_num_threads(previous)
