@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,7 +56,19 @@ class Engine:
     def load(cls, path: str | Path, max_seq_len: int = 4096, tokenizer_path: str | Path | None = None,
              mode_b_cache_bytes: int = 256 << 20, dequant_cache_bytes: int = 2 << 30, **cache_args) -> "Engine":
         path = Path(path)
-        cfg = EngineConfig.from_dir(path)
+        config = json.loads((path / "config.json").read_text())
+        if config.get("model_type") in ("llama", "olmoe"):
+            from .standard import StandardEngine
+
+            # This correctness backend keeps native or FP32 dense weights directly and uses a
+            # tensor KV cache, rather than the V4 dequantization cache and paged KV allocator.
+            if dequant_cache_bytes != 2 << 30:
+                raise ValueError("standard decoder does not implement the V4 dequantization cache")
+            if cache_args.pop("page_size", 64) != 64:
+                raise ValueError("standard decoder does not implement paged KV")
+            return StandardEngine.load(path, max_seq_len=max_seq_len, tokenizer_path=tokenizer_path,
+                                       mode_b_cache_bytes=mode_b_cache_bytes, **cache_args)
+        cfg = EngineConfig.from_hf(config)
         tok = load_tokenizer(tokenizer_path or path)
         model = V4Model(cfg, WeightStore(path, mode_b_cache_bytes=mode_b_cache_bytes), tokenizer=tok,
                         max_seq_len=max_seq_len, dequant_cache_bytes=dequant_cache_bytes)
@@ -112,7 +125,7 @@ class Engine:
         out: list[list[int]] = [[] for _ in prompts]
         done = [False] * len(prompts)
         try:
-            logits = self.model.forward(list(zip(seqs, prompts)), cache)
+            logits = self.model.forward(list(zip(seqs, prompts)), cache, stable_sequence_hc=True)
             for step in range(max_new_tokens):
                 nxt = sample(logits, temperature, gen).tolist()
                 active = [i for i in range(len(prompts)) if not done[i]]
@@ -125,7 +138,7 @@ class Engine:
                 active = [i for i in active if not done[i]]
                 if not active or step == max_new_tokens - 1:
                     break
-                logits = self.model.forward([(seqs[i], [out[i][-1]]) for i in active], cache)
+                logits = self.model.forward([(seqs[i], [out[i][-1]]) for i in active], cache, stable_sequence_hc=True)
         finally:
             for q in seqs:
                 cache.free(q)

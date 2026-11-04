@@ -74,6 +74,20 @@ def _tensor(value):
     return value.get() if isinstance(value, TensorRef) else value
 
 
+def _match_alignment(value: torch.Tensor, target: int | None, alignment: int = 64) -> torch.Tensor:
+    """Match a CPU matrix's address alignment without changing its values."""
+    if target is None or value.device.type != "cpu":
+        return value
+    if target < 0 or target >= alignment or target % value.element_size():
+        raise ValueError(f"invalid alignment {target}")
+    if value.is_contiguous() and value.data_ptr() % alignment == target:
+        return value
+    elements = alignment // value.element_size()
+    storage = torch.empty(value.numel() + elements, dtype=value.dtype, device=value.device)
+    offset = ((target - storage.data_ptr()) % alignment) // value.element_size()
+    return storage[offset:offset + value.numel()].view(value.shape).copy_(value)
+
+
 class QLinear:
     """y = x @ W^T for a weight in its stored format. FP8/FP4 weights take a block-quantized FP8
     activation (per 32 values, power-of-two scale), as the reference ``linear()`` does; other
@@ -264,7 +278,14 @@ class V4Model:
             L.is_idx_src = i in cfg.index_source_layers and L.ratio > 0
             L.rope = comp_rope if L.ratio else main_rope
             L.attn_norm, L.ffn_norm = W.ref(f"{p}.attn_norm.weight"), W.ref(f"{p}.ffn_norm.weight")
-            L.hc = {sub: (g(f"{p}.hc_{sub}_fn").float(), g(f"{p}.hc_{sub}_scale").float(), g(f"{p}.hc_{sub}_base").float()) for sub in ("attn", "ffn")}
+            # The reference copies these parameters into aligned PyTorch allocations. On some
+            # CPUs, using an unaligned mmap view changes the FP32 BLAS reduction order.
+            def hc_fn(sub):
+                name = f"{p}.hc_{sub}_fn"
+                return _match_alignment(g(name).float(), 0)
+
+            L.hc = {sub: (hc_fn(sub), g(f"{p}.hc_{sub}_scale").float(), g(f"{p}.hc_{sub}_base").float())
+                    for sub in ("attn", "ffn")}
             a = f"{p}.attn"
             L.sink = g(f"{a}.attn_sink").float()
             L.wq_a, L.wq_b, L.wkv, L.wo_b = lin(f"{a}.wq_a"), lin(f"{a}.wq_b"), lin(f"{a}.wkv"), lin(f"{a}.wo_b")
@@ -385,7 +406,12 @@ class V4Model:
         y += self.swiglu(L.shared, x)
         return y.type_as(x).view(shape)
 
-    def hc_mixes(self, x: torch.Tensor, fn, scale, base):
+    def hc_mixes(self, x: torch.Tensor, fn, scale, base, segments: list[Segment] | None = None):
+        # FP32 GEMM reduction order can vary with the batch shape. Match each sequence's
+        # standalone hyper-connection calculation when different sequences share a step.
+        if segments is not None and len(segments) > 1:
+            parts = [self.hc_mixes(x[:, sg.lo:sg.hi], fn, scale, base) for sg in segments]
+            return tuple(torch.cat(items, dim=1) for items in zip(*parts))
         x = x.flatten(2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.cfg.norm_eps)
         mixes = F.linear(x, fn) * rsqrt
@@ -593,10 +619,13 @@ class V4Model:
         cache: KVCache,
         all_logits: bool = False,
         capture: list | None = None,
+        stable_sequence_hc: bool = False,
     ) -> torch.Tensor:
         """Run one step. chunks: (sequence, new token ids) pairs. Returns FP32 logits for the last
         token of each chunk ([n_chunks, vocab]) or for every token ([T, vocab]). When ``capture`` is a
-        list, the residual stream after every layer ([T, hc, dim]) is appended to it."""
+        list, the residual stream after every layer ([T, hc, dim]) is appended to it.
+        ``stable_sequence_hc`` evaluates the small FP32 hyper-connection products per sequence,
+        keeping generation stable as sequences enter and leave a batch."""
         cfg = self.cfg
         segs, ids, pos, hashes = [], [], [], []
         lo = 0
@@ -625,12 +654,12 @@ class V4Model:
             if L.engram is not None:
                 h = self.engram(L.engram, h, hash_ids[:, :, L.engram.index])
             residual = h
-            a_pre, a_post, a_comb = self.hc_mixes(h, *L.hc["attn"])
+            a_pre, a_post, a_comb = self.hc_mixes(h, *L.hc["attn"], segments=segs if stable_sequence_hc else None)
             x = rms_norm(self.hc_pre(h, pre), _tensor(L.attn_norm), cfg.norm_eps)
             x = self.attention(L, x, segs, positions, cache, shared)
             h = self.hc_post(x, residual, a_post, a_comb)
             residual = h
-            f_pre, f_post, f_comb = self.hc_mixes(h, *L.hc["ffn"])
+            f_pre, f_post, f_comb = self.hc_mixes(h, *L.hc["ffn"], segments=segs if stable_sequence_hc else None)
             x = rms_norm(self.hc_pre(h, a_pre), _tensor(L.ffn_norm), cfg.norm_eps)
             x = self.moe(L, x)
             h = self.hc_post(x, residual, f_post, f_comb)

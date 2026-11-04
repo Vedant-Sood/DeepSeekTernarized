@@ -148,6 +148,7 @@ def _cmd_bench(a) -> int:
     import time
 
     from .engine import Engine
+    from .engine.standard import StandardEngine
 
     torch.set_num_threads(a.threads)
     torch.manual_seed(a.seed)
@@ -155,17 +156,30 @@ def _cmd_bench(a) -> int:
     eng = Engine.load(a.checkpoint, max_seq_len=a.prompt_len + a.gen_len + 1, max_seqs=a.batch,
                       max_tokens=a.batch * (a.prompt_len + a.gen_len + 64), mode_b_cache_bytes=a.mode_b_cache_mib << 20)
     t_load = time.perf_counter() - t0
-    cache = eng.new_cache()
-    seqs = [cache.new_sequence() for _ in range(a.batch)]
-    prompts = torch.randint(0, eng.cfg.vocab_size, (a.batch, a.prompt_len)).tolist()
-    t0 = time.perf_counter()
-    logits = eng.model.forward(list(zip(seqs, prompts)), cache)
-    t_pre = time.perf_counter() - t0
-    nxt = logits.argmax(-1).tolist()
-    t0 = time.perf_counter()
-    for _ in range(a.gen_len):
-        nxt = eng.model.forward([(q, [t]) for q, t in zip(seqs, nxt)], cache).argmax(-1).tolist()
-    t_dec = time.perf_counter() - t0
+    prompts = torch.randint(0, eng.cfg.vocab_size, (a.batch, a.prompt_len))
+    if isinstance(eng, StandardEngine):
+        t0 = time.perf_counter()
+        logits, _, cache = eng.model.forward(prompts)
+        t_pre = time.perf_counter() - t0
+        nxt = logits[:, -1].argmax(-1)
+        t0 = time.perf_counter()
+        for _ in range(a.gen_len):
+            logits, _, cache = eng.model.forward(nxt[:, None], cache)
+            nxt = logits[:, -1].argmax(-1)
+        t_dec = time.perf_counter() - t0
+        pages, store, backend = None, eng.model.store, "torch_standard"
+    else:
+        cache = eng.new_cache()
+        seqs = [cache.new_sequence() for _ in range(a.batch)]
+        t0 = time.perf_counter()
+        logits = eng.model.forward(list(zip(seqs, prompts.tolist())), cache)
+        t_pre = time.perf_counter() - t0
+        nxt = logits.argmax(-1).tolist()
+        t0 = time.perf_counter()
+        for _ in range(a.gen_len):
+            nxt = eng.model.forward([(q, [t]) for q, t in zip(seqs, nxt)], cache).argmax(-1).tolist()
+        t_dec = time.perf_counter() - t0
+        pages, store, backend = cache.pages_in_use, eng.model.w, "torch_ref"
     peak_rss_bytes = _rss_bytes(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, sys.platform)
     res = {
         "checkpoint": a.checkpoint,
@@ -180,13 +194,13 @@ def _cmd_bench(a) -> int:
         "decode_tok_s": round(a.batch * a.gen_len / t_dec, 3) if a.gen_len else None,
         "peak_rss_bytes": peak_rss_bytes,
         "peak_rss_gib": round(peak_rss_bytes / (1 << 30), 4),
-        "kv_pages_in_use": cache.pages_in_use,
-        "kernel_backend": "torch_ref",
-        "mode_b_cache_budget_bytes": eng.model.w.mode_b_cache_bytes,
-        "mode_b_cache_used_bytes": eng.model.w.mode_b_cache_used,
-        "mode_b_cache_hits": eng.model.w.mode_b_cache_hits,
-        "mode_b_cache_misses": eng.model.w.mode_b_cache_misses,
-        "mode_b_cache_evictions": eng.model.w.mode_b_cache_evictions,
+        "kv_pages_in_use": pages,
+        "kernel_backend": backend,
+        "mode_b_cache_budget_bytes": store.mode_b_cache_bytes,
+        "mode_b_cache_used_bytes": store.mode_b_cache_used,
+        "mode_b_cache_hits": store.mode_b_cache_hits,
+        "mode_b_cache_misses": store.mode_b_cache_misses,
+        "mode_b_cache_evictions": store.mode_b_cache_evictions,
     }
     print(json.dumps(res, indent=2))
     return 0

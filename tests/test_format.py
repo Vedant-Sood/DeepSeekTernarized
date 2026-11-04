@@ -14,6 +14,8 @@ from boilerplate.format.export import export
 from boilerplate.format.policy import Policy, Rule
 from boilerplate.kernels.cpu import ext
 from boilerplate.reference import compare_traces
+from boilerplate.ternary.fit import absmean_ternary
+from boilerplate.ternary.pack import unpack
 from boilerplate.testing.tiny import write_tiny_checkpoint
 
 needs_ext = pytest.mark.skipif(ext() is None, reason="C++ extension unavailable")
@@ -54,6 +56,52 @@ def test_policy_rules_and_bits():
     assert restored.rule_for("layers.0.attn.wq_a").mode == "B"
     assert restored.rule_for("layers.0.ffn.experts.0.w1").mode == "C"
     assert restored.rule_for("layers.0.ffn.experts.0.w1").packing == "tq1"
+    with pytest.raises(ValueError, match="group must be positive"):
+        Rule(match=".", mode="C", group=0)
+    with pytest.raises(ValueError, match="single-term absmean"):
+        Rule(match=".", mode="C", k=2, quantizer="absmean")
+
+
+def test_size_guard_counts_ragged_rows_and_scales(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text("{}")
+    save_file({"linear.weight": torch.ones(3, 1, dtype=torch.bfloat16)}, str(source / "model.safetensors"))
+    rule = Rule(match="linear", mode="C", k=4, group=16, packing="tq2")
+    assert rule.effective_bits() < 0.85 * 16
+    assert rule.effective_bits(columns=1) == 96
+    with pytest.raises(ValueError, match="not below"):
+        export(source, tmp_path / "output", Policy("ragged", [rule]), log=lambda *_: None)
+
+
+@pytest.mark.parametrize("name", ["standard_absmean_tq1", "standard_absmean_tq2", "standard_absmean_tq1_gptq",
+                                  "standard_absmean_tq2_gptq", "standard_k2_tq1", "standard_k2_tq1_gptq"])
+def test_standard_policies_target_only_block_linears(name):
+    policy = Policy.load(Path(__file__).resolve().parents[1] / "configs" / "policy" / f"{name}.yaml")
+    for base in ("model.layers.3.self_attn.q_proj", "model.layers.2.mlp.up_proj",
+                 "model.layers.9.mlp.experts.4.down_proj"):
+        assert policy.rule_for(base).mode == "C"
+    for base in ("model.embed_tokens", "lm_head", "model.layers.0.mlp.gate", "model.layers.0.input_layernorm"):
+        assert policy.rule_for(base).mode == "A"
+    assert not policy.default.allow_larger and all(not rule.allow_larger for rule in policy.rules)
+
+
+@pytest.mark.parametrize("packing", ["tq1", "tq2"])
+def test_absmean_policy_exports_matching_trits_and_scales(tmp_path, packing):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text("{}")
+    weight = torch.randn(3, 19, generator=torch.Generator().manual_seed(51)).to(torch.bfloat16)
+    save_file({"linear.weight": weight}, str(source / "model.safetensors"))
+    rule = Rule(match="linear", mode="C", k=1, group=16, packing=packing, quantizer="absmean")
+    out = export(source, tmp_path / "output", Policy("absmean", [rule]), log=lambda *_: None)
+    store = WeightStore(out)
+    expected = absmean_ternary(weight, 16)
+    assert torch.equal(unpack(store.get("linear.tq0.packed"), packing, 19), expected.trits)
+    assert torch.equal(store.get("linear.tq0.scale"), expected.scale)
+    actual_bpw = 8 * (store.get("linear.tq0.packed").numel() + 2 * expected.scale.numel()) / weight.numel()
+    assert rule.effective_bits(columns=19) == pytest.approx(actual_bpw)
+    assert store.mode_of("linear")["quantizer"] == "absmean"
 
 
 @needs_ext
@@ -115,10 +163,21 @@ def test_mixed_mode_b_c_export_and_run(tiny, ids, tmp_path):
     src, dst = WeightStore(tiny), WeightStore(mixed)
     coded_names = [name for entry in meta.values() if entry["mode"] == "B" for name in entry["coded"]]
     assert coded_names
-    b_names = [f"{base}.{suffix}" for base, entry in meta.items() if entry["mode"] == "B"
-               for suffix in ("weight", "scale") if f"{base}.{suffix}" in src]
+    b_names = [name for base, entry in meta.items() if entry["mode"] == "B"
+               for name in (base, f"{base}.weight", f"{base}.scale") if name in src]
     assert set(coded_names) <= set(b_names)
+    for name in ("layers.1.engram.q_weight", "layers.1.engram.k_weight"):
+        assert meta[name]["mode"] == "B" and name in coded_names
     for name in b_names:
+        assert torch.equal(src.get(name).view(torch.uint8), dst.get(name).view(torch.uint8)), name
+    source_names = set(src.names())
+    for name in source_names:
+        if name.endswith(".weight") or (name.endswith(".scale") and f"{name[:-6]}.weight" in source_names):
+            continue
+        if src.get(name).element_size() <= 2:
+            assert meta[name]["mode"] == "B" and name in coded_names
+        else:
+            assert meta[name]["mode"] == "A"
         assert torch.equal(src.get(name).view(torch.uint8), dst.get(name).view(torch.uint8)), name
 
     expected = Engine.load(c_only, max_seq_len=128).trace(ids, decode_from=13)
