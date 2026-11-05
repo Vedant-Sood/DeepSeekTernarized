@@ -72,12 +72,16 @@ def sha256(t: torch.Tensor) -> str:
 
 
 class _ShardWriter:
-    def __init__(self, out: Path, shard_bytes: int):
+    """Accumulates tensors into shards. ``on_flush(files)`` runs after each shard is on disk, so
+    the export journal can record what is safely written (resume after interruption)."""
+
+    def __init__(self, out: Path, shard_bytes: int, files: list | None = None, on_flush=None):
         self.out, self.limit = out, shard_bytes
         self.cur: dict[str, torch.Tensor] = {}
         self.size = 0
-        self.files: list[tuple[str, list[str]]] = []
-        self.k = 0
+        self.files: list[tuple[str, list[str]]] = [tuple(x) for x in (files or [])]
+        self.k = len(self.files)
+        self.on_flush = on_flush
 
     def add(self, name: str, t: torch.Tensor):
         nb = t.numel() * t.element_size()
@@ -94,6 +98,8 @@ class _ShardWriter:
         save_file(self.cur, str(self.out / fname))
         self.files.append((fname, list(self.cur)))
         self.cur, self.size = {}, 0
+        if self.on_flush is not None:
+            self.on_flush(self.files)
 
     def finish(self) -> dict[str, str]:
         self.flush()
@@ -113,21 +119,48 @@ def export(
     hessians: dict[str, torch.Tensor] | None = None,
     shard_bytes: int = 2 << 30,
     log=print,
+    resume: bool = True,
 ) -> Path:
+    """Stream ``source`` tensor by tensor into ``out_dir`` under ``policy``.
+
+    Restartable: ``out_dir/.export_journal.json`` lists every shard already written and the
+    manifest entries of the weights inside it. A rerun with the same source and policy skips
+    those weights (their shards are kept, checked by size) and continues; another policy or
+    source starts over. Peak memory is one source tensor plus one output shard.
+    """
     src, out = Path(source), Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     ws = WeightStore(src)
     names = ws.names()
     bases = bases_of(names)
     in_base = {t for ts in bases.values() for t in ts}
-    writer = _ShardWriter(out, shard_bytes)
+    journal_path = out / ".export_journal.json"
+    identity = {"source": str(src.resolve()), "policy": policy.to_dict(), "shard_bytes": shard_bytes,
+                "hessians": sorted(hessians) if hessians else []}
     tensors_meta: dict[str, dict] = {}
-    total_params = 0
-    total_bytes = 0
-    by_mode: dict[str, list[int]] = {}
+    pending: dict[str, dict] = {}
+    files: list = []
+    if resume and journal_path.exists():
+        j = json.loads(journal_path.read_text())
+        if j["identity"] == identity and all((out / f).exists() and (out / f).stat().st_size == s
+                                             for f, s in j["sizes"].items()):
+            files, tensors_meta = j["files"], j["tensors"]
+            log(f"resuming export: {len(tensors_meta)} entries in {len(files)} shards already written")
+        else:
+            log("export journal is for another source/policy or its shards changed: starting over")
+
+    def on_flush(written):
+        flushed = {n for _, ns in written for n in ns}
+        for base in [b for b, m in pending.items() if set(m["stored"]) <= flushed]:
+            tensors_meta[base] = pending.pop(base)
+        tmp = journal_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"identity": identity, "files": written, "tensors": tensors_meta,
+                                   "sizes": {f: (out / f).stat().st_size for f, _ in written}}))
+        tmp.replace(journal_path)
+
+    writer = _ShardWriter(out, shard_bytes, files, on_flush)
 
     def record(base, meta, stored: dict[str, torch.Tensor], params: int):
-        nonlocal total_params, total_bytes
         nb = 0
         meta["stored"] = {}
         for n, t in stored.items():
@@ -137,12 +170,7 @@ def export(
             meta["stored"][n] = {"dtype": str(t.dtype).replace("torch.", ""), "shape": list(t.shape), "sha256": sha256(t)}
         meta["bytes"] = nb
         meta["params"] = params
-        tensors_meta[base] = meta
-        total_params += params
-        total_bytes += nb
-        m = by_mode.setdefault(meta["mode"], [0, 0])
-        m[0] += params
-        m[1] += nb
+        pending[base] = meta
 
     def encode_lossless(tnames):
         stored, parts_meta = {}, {}
@@ -163,6 +191,9 @@ def export(
 
     done = 0
     for base, tnames in sorted(bases.items()):
+        if base in tensors_meta:  # written before an interruption
+            done += 1
+            continue
         rule = policy.rule_for(base)
         w = ws.get(tnames[0])
         scale = ws.get(tnames[1]) if len(tnames) > 1 else None
@@ -210,7 +241,7 @@ def export(
             log(f"  {done}/{len(bases)} weights")
     # Non-weight tensors can use Mode B too; wider dtypes and Mode C selections stay original.
     for n in names:
-        if n not in in_base:
+        if n not in in_base and n not in tensors_meta:
             t = ws.get(n)
             meta = {"mode": "A", "shape": list(t.shape), "source_dtype": str(t.dtype).replace("torch.", "")}
             if policy.rule_for(n).mode == "B" and t.element_size() <= 2:
@@ -221,6 +252,16 @@ def export(
             record(n, meta, stored, t.numel())
 
     weight_map = writer.finish()
+    tensors_meta.update(pending)
+    pending.clear()
+    tensors_meta = dict(sorted(tensors_meta.items()))
+    total_params = sum(m["params"] for m in tensors_meta.values())
+    total_bytes = sum(m["bytes"] for m in tensors_meta.values())
+    by_mode: dict[str, list[int]] = {}
+    for m in tensors_meta.values():
+        acc = by_mode.setdefault(m["mode"], [0, 0])
+        acc[0] += m["params"]
+        acc[1] += m["bytes"]
     for meta in tensors_meta.values():
         for n in meta["stored"]:
             meta["stored"][n]["file"] = weight_map[n]
@@ -241,6 +282,7 @@ def export(
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1))
     (out / "model.safetensors.index.json").write_text(json.dumps({"metadata": {"total_size": total_bytes}, "weight_map": weight_map}))
+    journal_path.unlink(missing_ok=True)
     shutil.copy(src / "config.json", out / "config.json")
     for f in ("tokenizer.json", "tokenizer_config.json"):
         if (src / f).exists():
