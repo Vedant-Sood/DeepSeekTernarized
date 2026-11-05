@@ -39,7 +39,7 @@ PY
     OUT=$(python -c "import yaml;print(yaml.safe_load(open('$CFG'))['out_dir'])")
     for d in "$OUT"/mode_d_*; do
       python scripts/eval/standard_ppl.py "$d" "$DATA/wikitext2_test.txt" --out "$d/ppl_wikitext2.json"
-      boilerplate lm-eval "$d" --tasks arc_easy,hellaswag,piqa,winogrande --out "$d/lm_eval.json" --max-seq-len 2048
+      boilerplate lm-eval "$d" --tasks mmlu,arc_challenge,hellaswag,piqa,winogrande,gsm8k --out "$d/lm_eval.json" --max-seq-len 2048
     done
     ;;
   *) sed -n 2,10p "$0"; exit 2 ;;

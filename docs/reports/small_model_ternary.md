@@ -16,7 +16,9 @@ throughput probe has been run.
 | Standard-decoder checks | `tests/test_standard_engine.py` | Tiny random Llama/OLMoE comparisons against Hugging Face, including greedy tokens, Mode B byte parity and a mixed B/C export. |
 | llama.cpp baseline | External checkout `ggml-org/llama.cpp` at `149f5641b931aaf33697d70f9abc90c3e5300247` | Pinned source; CPU quantize, importance-matrix, perplexity and benchmark tools built. |
 
-These primitives are not yet a training pipeline or a complete Mode D model exporter. The
+*Superseded on 2026-11-05: the training pipeline, Mode D export, teacher data, routing
+diagnostics, distributed checkpointing and GGUF export now exist; see "Follow-up, 2026-11-05"
+at the end. The original paragraph follows.* These primitives are not yet a training pipeline or a complete Mode D model exporter. The
 standard path is not yet validated on the pretrained OLMoE checkpoint. It uses a simple tensor
 KV cache and does not yet have a GPU path or paged KV. Offline teacher-data generation, routing
 diagnostics, distributed checkpoint/resume, distributed training and GGUF export are not yet
@@ -250,3 +252,53 @@ overlap and expert-load entropy are **not run** for the reasons above.
 The pre-registered verdict is **untested**: there is no OLMoE QAT run or evaluated conventional
 baseline to compare. In particular, the primitive tests do not establish model quality, file
 size or speed.
+
+## Follow-up, 2026-11-05: code complete for the gated runs
+
+Everything the plan needs before a GPU is approved is now in the repository and tested on tiny
+random models on CPU. **Nothing in this section is a measurement of a pretrained model**: no QAT
+run, throughput probe or GPU kernel run has happened.
+
+| Piece | Where | Tested by |
+|---|---|---|
+| Training loop from one YAML config: FSDP2 when `WORLD_SIZE > 1`, AdamW (or 8-bit AdamW), LR warmup + cosine, lambda warmup, CE or CE + KL to stored teacher top-k, gradient clipping, JSON-lines logs, routing drift on a fixed probe batch, checkpoints, exact resume, Mode D export at the end and at `export_at_tokens` | `boilerplate/qat/train.py`, `boilerplate qat-train` | `tests/test_qat_train.py` (export parity with the engine, exact resume, OLMoE with offline teacher, snapshots) |
+| Approval gate: runs over 20 optimizer steps refuse to start without `approval:` in the config | `train.py` | `test_approval_gate` |
+| Token files, sampler with resumable state and rank split; offline teacher top-k shards | `qat/data.py`, `qat/teacher.py`, `qat-tokenize`, `qat-teacher` | `tests/test_qat_train.py` |
+| OLMoE F32 → BF16 cast with SHA-256 per shard (decision: cast first, both paths supported) | `checkpoint/cast.py`, `boilerplate cast` | `test_cast_checkpoint_f32_to_bf16` |
+| Mode D export (one absmean ternary term per BitLinear) and GGUF `TQ1_0`/`TQ2_0` | `qat/export.py`, `format/gguf_export.py` | `tests/test_qat_train.py`, `tests/test_gguf_export.py` |
+| CUDA ternary GEMM/GEMV and grouped expert GEMM (TQ1/TQ2, int8 activations, one launch for all experts) | `kernels/csrc/ternary_cuda_kernel.cu`, `kernels/ternary_cuda.py` | `tests/test_ternary_cuda.py`: reference vs dense and vs the C++ CPU kernel run here; **the CUDA parity tests skip: the kernel has not been compiled or run** (no GPU or toolkit in this container) |
+| Compute / memory / cost estimator | `qat/estimate.py`, `boilerplate qat-estimate` | `test_qat_estimate` |
+| lm-eval-harness adapter (loglikelihood, rolling, generate_until) | `evals/lm_eval_adapter.py`, `boilerplate lm-eval` | `tests/test_lm_eval_adapter.py` (scores match transformers) |
+| Launch scripts | `scripts/launch/smollm2_shakedown.sh`, `scripts/launch/olmoe_qat.sh`, `configs/qat/*.yaml` | `bash -n`; gates checked by hand |
+
+Still not built: expert parallelism (FSDP2 shards experts like any other weight, which is enough
+for OLMoE at 4 × 80 GB but not for V4.1), a fused grouped-expert path in the training graph
+(`qat/model.py::Experts` loops over experts in Python, which keeps MFU low on MoE), a NEON build of
+the CPU kernel (not testable here: no ARM runner or qemu), and BF16 activations in the CUDA kernel
+(int8 only; BF16 falls back to the dequantized matmul).
+
+### Compute estimates (planning numbers, not measurements)
+
+From `boilerplate qat-estimate` with the committed configs: training FLOPs = 6 × active
+parameters × tokens; the offline teacher pass adds 2 × active × tokens once. SmolLM2-360M has
+361.8 M parameters (counted from its safetensors headers). OLMoE-1B-7B-0125: 6.92 B total,
+1.28 B active (computed from its `config.json`: 16 layers, hidden 2048, 64 experts of
+intermediate 1024, top-8, untied 50,304-token embeddings; the model card says 6.9 B / 1.3 B).
+MFU is an assumption until a 20-step probe gives a measured tok/s; MoE training with the
+per-expert loop is expected at the low end.
+
+| Run | Tokens | Train FLOPs | Teacher FLOPs | Memory / GPU (est.) | Hardware | Wall clock at MFU 10% / 20% / 40% | GPU-hours at the same |
+|---|---|---|---|---|---|---|---|
+| SmolLM2 shakedown | 0.5 B | 1.1e18 | 3.6e17 | 2.5 GiB (8-bit AdamW, checkpointing) | 1 × RTX 4060 laptop (~60 TFLOP/s BF16 assumed) | 50 h / 25 h / 13 h | same |
+| OLMoE QAT | 1 B | 7.7e18 | 2.6e18 | 19.8 GiB (FSDP over 4) | 4 × H100 80 GB | 5.4 h / 2.7 h / 1.4 h | 22 / 11 / 5 |
+| OLMoE QAT | 3 B | 2.3e19 | 7.7e18 | 19.8 GiB | 4 × H100 | 16 h / 8.1 h / 4.1 h | 65 / 32 / 16 |
+| OLMoE QAT (snapshots at 1 B, 3 B) | 10 B | 7.7e19 | 2.6e19 | 19.8 GiB | 4 × H100 | 54 h / 27 h / 13.5 h | 216 / 108 / 54 |
+
+The 10 B estimate at MFU 10–20 % (108–216 H100-hours) agrees with the plan's 100–200. Multiply
+GPU-hours by the provider's hourly price for cost (`--price`). The OLMoE memory figure leaves room
+for a larger micro batch; the plan's 2–4 GPUs are both feasible.
+
+Next, all gated on Vedant: approve the SmolLM2 probe and shakedown budget (then
+`scripts/launch/smollm2_shakedown.sh prepare|probe|train|eval`), and the OLMoE budget
+(`scripts/launch/olmoe_qat.sh`). The OLMoE baselines and PTQ arms need a machine with more than
+this container's 15 GB RAM; llama.cpp runs need a machine where building it is allowed.
