@@ -47,11 +47,16 @@ class _Linear:
 
 class StandardDecoder:
     def __init__(self, path: str | Path, *, dtype: torch.dtype = torch.float32,
-                 mode_b_cache_bytes: int = 256 << 20, ternary_backend: str = "auto"):
+                 mode_b_cache_bytes: int = 256 << 20, ternary_backend: str = "auto",
+                 expert_cache_bytes: int | None = None):
         """``ternary_backend``: "auto"/"cpp" run the C++ add/subtract kernel; "torch" multiplies the
         int8-quantized activations by a cached FP32 dequantized weight (same values, BLAS speed)."""
         self.path = Path(path)
         self.ternary_backend = ternary_backend
+        from .expert_cache import ExpertCache
+
+        # MoE experts are built on first use; this bounds how many stay materialized (None: all)
+        self.expert_cache = ExpertCache(host_bytes=expert_cache_bytes)
         self.config = json.loads((self.path / "config.json").read_text())
         c = self.config
         if c.get("model_type") not in ("llama", "olmoe"):
@@ -138,9 +143,10 @@ class StandardDecoder:
             token, slot = torch.where(indices == expert)
             if not token.numel():
                 continue
-            if expert not in layer.experts:
-                layer.experts[expert] = self._mlp(f"{layer.prefix}.experts.{expert}")
-            result = self._run_mlp(layer.experts[expert], flat[token]) * values[token, slot, None]
+            key = (layer.prefix, expert)
+            mlp = self.expert_cache.get(key, lambda e=expert: self._mlp(f"{layer.prefix}.experts.{e}"))
+            result = self._run_mlp(mlp, flat[token]) * values[token, slot, None]
+            self.expert_cache.touch(key)
             output.index_add_(0, token, result.to(output.dtype))
         return output.view(shape)
 
@@ -207,10 +213,10 @@ class StandardEngine:
     @classmethod
     def load(cls, path: str | Path, *, dtype: torch.dtype = torch.float32, max_seq_len=4096,
              mode_b_cache_bytes: int = 256 << 20, tokenizer_path=None, max_seqs=8, max_tokens=16384,
-             ternary_backend: str = "auto"):
+             ternary_backend: str = "auto", expert_cache_bytes: int | None = None):
         from .engine import load_tokenizer
         return cls(StandardDecoder(path, dtype=dtype, mode_b_cache_bytes=mode_b_cache_bytes,
-                                   ternary_backend=ternary_backend),
+                                   ternary_backend=ternary_backend, expert_cache_bytes=expert_cache_bytes),
                    load_tokenizer(tokenizer_path or path), max_seq_len=max_seq_len,
                    max_seqs=max_seqs, max_tokens=max_tokens)
 

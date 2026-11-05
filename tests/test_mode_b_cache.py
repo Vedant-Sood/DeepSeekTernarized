@@ -83,7 +83,7 @@ def test_bounded_engine_trace_matches_mode_a(checkpoints, budget):
     assert all(layer.bit_exact for layer in comparison.layers), comparison.table()
     assert comparison.logits.bit_exact, comparison.table()
     assert engine.model.w.mode_b_cache_used <= budget
-    experts = [expert for layer in engine.model.layers for expert in layer.experts if expert is not None]
+    experts = [entry[0] for entry in engine.model.expert_cache.host.values()]
     assert experts
     assert all(isinstance(linear._weight, TensorRef) for expert in experts for linear in expert)
 

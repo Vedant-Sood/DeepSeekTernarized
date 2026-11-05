@@ -249,7 +249,12 @@ class _NS:
 
 
 class V4Model:
-    def __init__(self, cfg: EngineConfig, weights: WeightStore, tokenizer=None, max_seq_len: int = 4096, dequant_cache_bytes: int = 2 << 30):
+    def __init__(self, cfg: EngineConfig, weights: WeightStore, tokenizer=None, max_seq_len: int = 4096, dequant_cache_bytes: int = 2 << 30,
+                 expert_cache_bytes: int | None = None):
+        from .expert_cache import ExpertCache
+
+        # routed experts are built on first use; this bounds how many stay materialized (None: all)
+        self.expert_cache = ExpertCache(host_bytes=expert_cache_bytes)
         self.cfg = cfg
         self.ternary_backend = "auto"
         QLinear.cache = DequantCache(dequant_cache_bytes) if dequant_cache_bytes else None
@@ -324,7 +329,7 @@ class V4Model:
             L.gate_w = g(f"{f}.gate.weight").float()
             L.gate_b = W.maybe(f"{f}.gate.bias")
             L.gate_b = L.gate_b.float() if L.gate_b is not None else None
-            L.experts = [None] * cfg.n_routed_experts  # built on first use; weights stay mmap'd
+            # routed experts are built on first use through self.expert_cache; weights stay mmap'd
             L.expert_prefix = f"{f}.experts"
             L.shared = tuple(lin(f"{f}.shared_experts.{w}") for w in ("w1", "w2", "w3"))
             L.engram = None
@@ -364,10 +369,8 @@ class V4Model:
         return lin
 
     def expert(self, L, e: int):
-        if L.experts[e] is None:
-            pre = f"{L.expert_prefix}.{e}"
-            L.experts[e] = tuple(self.linear(f"{pre}.{w}") for w in ("w1", "w2", "w3"))
-        return L.experts[e]
+        pre = f"{L.expert_prefix}.{e}"
+        return self.expert_cache.get(pre, lambda: tuple(self.linear(f"{pre}.{w}") for w in ("w1", "w2", "w3")))
 
     def swiglu(self, ws, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
         w1, w2, w3 = ws
@@ -411,6 +414,7 @@ class V4Model:
                 continue
             idx, top = torch.where(indices == e)
             y[idx] += self.swiglu(self.expert(L, e), x[idx], weights[idx, top, None])
+            self.expert_cache.touch(f"{L.expert_prefix}.{e}")
         y += self.swiglu(L.shared, x)
         return y.type_as(x).view(shape)
 

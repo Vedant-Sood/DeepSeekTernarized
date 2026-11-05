@@ -155,7 +155,8 @@ def _cmd_bench(a) -> int:
     torch.manual_seed(a.seed)
     t0 = time.perf_counter()
     eng = Engine.load(a.checkpoint, max_seq_len=a.prompt_len + a.gen_len + 1, max_seqs=a.batch,
-                      max_tokens=a.batch * (a.prompt_len + a.gen_len + 64), mode_b_cache_bytes=a.mode_b_cache_mib << 20)
+                      max_tokens=a.batch * (a.prompt_len + a.gen_len + 64), mode_b_cache_bytes=a.mode_b_cache_mib << 20,
+                      expert_cache_bytes=None if a.expert_cache_mib is None else a.expert_cache_mib << 20)
     t_load = time.perf_counter() - t0
     prompts = torch.randint(0, eng.cfg.vocab_size, (a.batch, a.prompt_len))
     if isinstance(eng, StandardEngine):
@@ -202,6 +203,7 @@ def _cmd_bench(a) -> int:
         "mode_b_cache_hits": store.mode_b_cache_hits,
         "mode_b_cache_misses": store.mode_b_cache_misses,
         "mode_b_cache_evictions": store.mode_b_cache_evictions,
+        "expert_cache": eng.model.expert_cache.stats(),
     }
     print(json.dumps(res, indent=2))
     return 0
@@ -360,6 +362,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--seed", type=int, default=0)
     s.add_argument("--threads", type=int, default=4, help="PyTorch CPU math threads")
     s.add_argument("--mode-b-cache-mib", type=int, default=256, help="maximum decoded Mode B bytes retained in the LRU (MiB)")
+    s.add_argument("--expert-cache-mib", type=int, help="bound on materialized routed experts (default: keep all)")
     s.set_defaults(fn=_cmd_bench)
 
     s = sub.add_parser("compare", help="compare two traces layer by layer")

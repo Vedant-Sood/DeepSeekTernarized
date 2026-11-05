@@ -218,3 +218,13 @@ def test_standard_routing_capture(tmp_path):
     engine.model.forward(torch.tensor([[3, 8, 2, 17]]), capture_routing=routing)
     assert len(routing) == 2 and routing[0].shape == (4, 2)
     assert topk_overlap(routing[0], routing[0]) == 1.0
+
+
+def test_olmoe_expert_cache_budget_keeps_outputs(tmp_path):
+    _make_model(tmp_path, "olmoe")
+    ids = torch.tensor([[3, 8, 2, 17, 12, 5]])
+    a = StandardEngine.load(tmp_path).trace(ids, decode_from=4)
+    eng = StandardEngine.load(tmp_path, expert_cache_bytes=0)
+    b = eng.trace(ids, decode_from=4)
+    assert torch.equal(a.logits, b.logits)
+    assert eng.model.expert_cache.stats()["host_experts"] == 0
