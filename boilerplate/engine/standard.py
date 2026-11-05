@@ -206,7 +206,8 @@ class StandardEngine:
         if min(max_seq_len, max_seqs, max_tokens) <= 0:
             raise ValueError("cache limits must be positive")
         self.model, self.tokenizer = model, tokenizer
-        self.cfg = SimpleNamespace(eos_token_id=model.config.get("eos_token_id"), vocab_size=model.config["vocab_size"])
+        self.cfg = SimpleNamespace(eos_token_id=model.config.get("eos_token_id"), bos_token_id=model.config.get("bos_token_id"),
+                                   vocab_size=model.config["vocab_size"])
         self.max_seq_len = min(max_seq_len, model.config.get("max_position_embeddings", max_seq_len))
         self.max_seqs, self.max_tokens = max_seqs, max_tokens
 

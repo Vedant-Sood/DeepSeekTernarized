@@ -377,6 +377,18 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--expert-cache-mib", type=int, help="bound on materialized routed experts (default: keep all)")
     s.set_defaults(fn=lambda a: __import__("boilerplate.serve", fromlist=["main"]).main(a))
 
+    s = sub.add_parser("lm-eval", help="run lm-evaluation-harness tasks in process on a checkpoint (needs lm_eval)")
+    s.add_argument("checkpoint")
+    s.add_argument("--tasks", required=True, help="comma-separated harness task names")
+    s.add_argument("--limit", type=float, help="examples per task (or a fraction)")
+    s.add_argument("--num-fewshot", type=int)
+    s.add_argument("--seed", type=int, default=1234)
+    s.add_argument("--max-seq-len", type=int, default=4096)
+    s.add_argument("--threads", type=int, default=4, help="PyTorch CPU math threads")
+    s.add_argument("--mode-b-cache-mib", type=int, default=256)
+    s.add_argument("--out", help="write the results JSON here")
+    s.set_defaults(fn=lambda a: __import__("boilerplate.evals.lm_eval_adapter", fromlist=["main"]).main(a))
+
     s = sub.add_parser("compare", help="compare two traces layer by layer")
     s.add_argument("reference")
     s.add_argument("candidate")
