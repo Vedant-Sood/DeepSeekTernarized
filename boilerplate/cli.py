@@ -254,6 +254,42 @@ def _cmd_gguf(a) -> int:
     return 0
 
 
+def _cmd_cast(a) -> int:
+    from .checkpoint.cast import cast_checkpoint
+
+    cast_checkpoint(a.source, a.out, a.dtype)
+    return 0
+
+
+def _cmd_qat_tokenize(a) -> int:
+    from .qat.data import tokenize_text_file
+
+    out = tokenize_text_file(a.text, a.tokenizer, a.out)
+    print(out.with_suffix(".json").read_text())
+    return 0
+
+
+def _cmd_qat_teacher(a) -> int:
+    from transformers import AutoModelForCausalLM
+
+    from .qat.data import TokenWindows
+    from .qat.teacher import precompute
+
+    dev = a.device if a.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+    model = AutoModelForCausalLM.from_pretrained(a.teacher, dtype=torch.bfloat16 if dev == "cuda" else torch.float32)
+    windows = TokenWindows(a.tokens, a.seq_len)
+    n = min(len(windows), a.windows) if a.windows else len(windows)
+    precompute(model, windows, a.out, list(range(n)), k=a.k, temperature=a.temperature, batch=a.batch, device=dev)
+    return 0
+
+
+def _cmd_qat_train(a) -> int:
+    from .qat.train import main as train_main
+
+    return train_main([str(a.config)] + (["--max-steps", str(a.max_steps)] if a.max_steps is not None else [])
+                      + (["--plan"] if a.plan else []))
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="boilerplate")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -351,6 +387,36 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--base", help="llama.cpp BF16/F32 conversion of the same source; its other tensors and metadata are kept")
     s.add_argument("--packing", choices=("tq1", "tq2"), default="tq1")
     s.set_defaults(fn=_cmd_gguf)
+
+    s = sub.add_parser("cast", help="cast a safetensors checkpoint to another float dtype (e.g. OLMoE F32 -> BF16)")
+    s.add_argument("source")
+    s.add_argument("out")
+    s.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
+    s.set_defaults(fn=_cmd_cast)
+
+    s = sub.add_parser("qat-tokenize", help="tokenize a text file into a QAT token file (.bin + .json)")
+    s.add_argument("text")
+    s.add_argument("tokenizer", help="tokenizer.json")
+    s.add_argument("out", help="output .bin")
+    s.set_defaults(fn=_cmd_qat_tokenize)
+
+    s = sub.add_parser("qat-teacher", help="precompute teacher top-k log-probs per training window (offline distillation)")
+    s.add_argument("teacher", help="HF checkpoint of the unquantized teacher")
+    s.add_argument("tokens", help="token file from qat-tokenize")
+    s.add_argument("out")
+    s.add_argument("--seq-len", type=int, default=2048)
+    s.add_argument("--k", type=int, default=32)
+    s.add_argument("--temperature", type=float, default=1.0)
+    s.add_argument("--batch", type=int, default=1)
+    s.add_argument("--windows", type=int, help="only the first N windows")
+    s.add_argument("--device", default="auto")
+    s.set_defaults(fn=_cmd_qat_teacher)
+
+    s = sub.add_parser("qat-train", help="ternary QAT from a YAML run config (runs over 20 steps need approval: in the config)")
+    s.add_argument("config")
+    s.add_argument("--max-steps", type=int)
+    s.add_argument("--plan", action="store_true", help="print steps/tokens and exit")
+    s.set_defaults(fn=_cmd_qat_train)
 
     a = p.parse_args(argv)
     return a.fn(a)

@@ -118,3 +118,20 @@ def test_olmoe_with_offline_teacher(tmp_path):
     manifest = json.loads(open(f"{result['mode_d']}/manifest.json").read())
     assert manifest["tensors"]["model.layers.0.mlp.experts.0.gate_proj"]["mode"] == "D"
     assert manifest["tensors"]["model.layers.0.mlp.gate"]["mode"] == "A"
+
+
+def test_cast_checkpoint_f32_to_bf16(tmp_path):
+    from safetensors.torch import load_file
+
+    from boilerplate.checkpoint.cast import cast_checkpoint
+
+    src = tmp_path / "f32"
+    _source(src, "olmoe")
+    out = cast_checkpoint(src, tmp_path / "bf16", "bf16", log=lambda *_: None)
+    a, b = load_file(src / "model.safetensors"), load_file(out / "model.safetensors")
+    assert a.keys() == b.keys()
+    for k in a:
+        assert b[k].dtype == torch.bfloat16 and torch.equal(b[k], a[k].to(torch.bfloat16))
+    rec = json.loads((out / "cast.json").read_text())
+    assert rec["shards"]["model.safetensors"]["tensors"] == len(a)
+    assert json.loads((out / "config.json").read_text())["torch_dtype"] == "bfloat16"
