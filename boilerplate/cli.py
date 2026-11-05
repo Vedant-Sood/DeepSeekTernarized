@@ -389,6 +389,16 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--out", help="write the results JSON here")
     s.set_defaults(fn=lambda a: __import__("boilerplate.evals.lm_eval_adapter", fromlist=["main"]).main(a))
 
+    s = sub.add_parser("qat-estimate", help="FLOPs, GPU memory, hours and cost for a QAT run config (no training)")
+    s.add_argument("config")
+    s.add_argument("--gpu", default="h100", help="h100, a100, l40s, rtx4090, rtx4060-laptop")
+    s.add_argument("--gpus", type=int, default=1, help="data-parallel (FSDP) world size")
+    s.add_argument("--mfu", type=float, default=0.35, help="assumed model FLOP utilization when --tok-s is not given")
+    s.add_argument("--tok-s", type=float, help="measured training throughput (all GPUs) from a probe run's log")
+    s.add_argument("--price", type=float, help="USD per GPU-hour, for a cost line")
+    s.add_argument("--token-budget", type=float, help="override the config's token budget (e.g. 3e9)")
+    s.set_defaults(fn=lambda a: __import__("boilerplate.qat.estimate", fromlist=["main"]).main(a))
+
     s = sub.add_parser("compare", help="compare two traces layer by layer")
     s.add_argument("reference")
     s.add_argument("candidate")

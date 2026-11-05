@@ -63,6 +63,7 @@ class RunConfig:
     routing_every: int = 100         # MoE only
     probe_windows: int = 4
     max_steps: int | None = None     # stop early (smoke tests); does not change the schedule
+    export_at_tokens: list = field(default_factory=list)  # extra Mode D snapshots (e.g. [1e9, 3e9])
     device: str = "auto"
     approval: str | None = None
     extra: dict = field(default_factory=dict)
@@ -170,6 +171,20 @@ def train(cfg: RunConfig, log=print) -> dict:
         else:
             save_sharded(ckpt_dist, model, optimizer, step=step, tokens_seen=tokens_seen, trainer_state=state)
 
+    def export_now(path):
+        """Mode D export of the current weights (every rank gathers, rank 0 writes)."""
+        from .export import export_mode_d
+
+        state = None
+        if world > 1:
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+            state = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+        if rank != 0:
+            return None
+        # the export ternarizes the master weights itself, so it does not depend on lambda
+        return export_mode_d(model, cfg.source, path, packing=cfg.packing, state_dict=state, log=log)
+
     log_file = (out / f"log.rank{rank}.jsonl").open("a")
     end = min(p["total_steps"], cfg.max_steps) if cfg.max_steps else p["total_steps"]
     if rank == 0:
@@ -219,20 +234,18 @@ def train(cfg: RunConfig, log=print) -> dict:
             log(json.dumps(record))
         if (step + 1) % cfg.checkpoint_every == 0 or step + 1 == end:
             save(step + 1)
+        for mark in cfg.export_at_tokens:  # quality-vs-tokens snapshots from one schedule
+            if tokens_seen - p["tokens_per_step"] < float(mark) <= tokens_seen and step + 1 < p["total_steps"]:
+                snap = export_now(out / f"mode_d_{cfg.packing}_{int(float(mark)):d}tok")
+                if snap:
+                    log(json.dumps({"event": "snapshot", "step": step + 1, "tokens": tokens_seen, "path": str(snap)}))
     log_file.close()
 
     result = {"steps": end, "tokens_seen": tokens_seen}
     if end == p["total_steps"]:  # finished the budget: export Mode D
-        from .export import export_mode_d
-
-        state = None
-        if world > 1:
-            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
-
-            state = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
-        if rank == 0:
-            result["mode_d"] = str(export_mode_d(model, cfg.source, out / f"mode_d_{cfg.packing}", packing=cfg.packing,
-                                                 state_dict=state, log=log))
+        path = export_now(out / f"mode_d_{cfg.packing}")
+        if path:
+            result["mode_d"] = str(path)
     if world > 1:
         dist.destroy_process_group()
     return result

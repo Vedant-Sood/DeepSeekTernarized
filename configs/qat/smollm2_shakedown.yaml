@@ -1,0 +1,27 @@
+# SmolLM2-360M ternary QAT shakedown on Vedant's RTX 4060 laptop GPU (8 GB). GATED: add
+# `approval: "<who>, <date>, <budget>"` only after Vedant approves the GPU budget.
+# Estimate first:  boilerplate qat-estimate configs/qat/smollm2_shakedown.yaml --gpu rtx4060-laptop
+# then a short measured probe (--max-steps 20 runs without approval) and re-estimate with --tok-s.
+source: work/models/smollm2-360m            # HuggingFaceTB/SmolLM2-360M, BF16
+train_tokens: work/data/fineweb_edu_smollm2.bin   # boilerplate qat-tokenize (SmolLM2 tokenizer)
+out_dir: work/qat/smollm2_shakedown
+token_budget: 500000000                      # 0.5 B tokens (plan: 2 B on a 24-80 GB GPU)
+seq_len: 2048
+micro_batch: 4
+grad_accum: 8                                # 65,536 tokens per optimizer step
+lr: 1.5e-4
+min_lr: 1.5e-5
+lr_warmup_steps: 200
+quant_warmup_steps: 1000
+group: 128
+master_dtype: bf16
+optimizer: adamw8bit                         # bitsandbytes; fits weights+grads+state in ~2.2 GB
+gradient_checkpointing: true
+teacher_dir: work/qat/smollm2_teacher_top32  # boilerplate qat-teacher (k=32); remove for CE only
+kl_weight: 0.5
+packing: tq1
+log_every: 10
+checkpoint_every: 250
+export_at_tokens: [100000000, 250000000]
+device: cuda
+approval: null

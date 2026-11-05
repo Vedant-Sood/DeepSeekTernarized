@@ -68,9 +68,10 @@ def test_train_export_parity_and_exact_resume(tmp_path):
     from boilerplate.qat.distributed import set_quantization_level
     from boilerplate.qat.model import load_for_qat
 
-    cfg = _cfg(tmp_path)
+    cfg = _cfg(tmp_path, export_at_tokens=[16 * 2 * 2])
     result = train(cfg, log=lambda *_: None)
     assert result["steps"] == 6 and "mode_d" in result
+    assert (tmp_path / "run_llama" / "mode_d_tq1_64tok" / "manifest.json").exists()
     log = [json.loads(line) for line in open(f"{cfg.out_dir}/log.rank0.jsonl")]
     assert [r["step"] for r in log] == list(range(1, 7)) and log[-1]["lambda"] == 1.0
     manifest = json.loads(open(f"{result['mode_d']}/manifest.json").read())
@@ -135,3 +136,17 @@ def test_cast_checkpoint_f32_to_bf16(tmp_path):
     rec = json.loads((out / "cast.json").read_text())
     assert rec["shards"]["model.safetensors"]["tensors"] == len(a)
     assert json.loads((out / "config.json").read_text())["torch_dtype"] == "bfloat16"
+
+
+def test_qat_estimate(tmp_path):
+    from boilerplate.qat.estimate import estimate, param_counts
+
+    cfg = _cfg(tmp_path, "olmoe")
+    p = param_counts(cfg.source)
+    assert p["experts"] == 4 and p["top_k"] == 2 and 0 < p["expert"] < p["total"]
+    assert p["active"] == p["total"] - p["expert"] // 2
+    e = estimate(cfg, world=2, gpu="h100", mfu=0.5)
+    assert e["train_flops"] == 6 * p["active"] * e["tokens"] and e["fits"]
+    measured = estimate(cfg, world=2, tok_s=100.0, price_per_gpu_hour=2.0)
+    assert measured["wall_clock_hours"] == pytest.approx(e["tokens"] / 100 / 3600)
+    assert measured["cost"] == pytest.approx(measured["gpu_hours"] * 2.0)

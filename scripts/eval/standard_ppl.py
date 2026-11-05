@@ -1,4 +1,4 @@
-"""WikiText-2 perplexity of a Llama/OLMoE checkpoint (any Boilerplate mode) on the standard decoder.
+"""WikiText-2 perplexity of a checkpoint (Llama/OLMoE on the standard decoder, DeepSeek V4.1 on the main engine; any mode).
 
 Protocol (same as llama.cpp ``llama-perplexity`` so the GGUF baselines are comparable): the joined
 text (rows joined with blank lines) is tokenized without BOS, cut into non-overlapping windows of
@@ -36,13 +36,22 @@ def main(argv=None) -> int:
     import torch
     import torch.nn.functional as F
 
+    from boilerplate.engine import Engine
     from boilerplate.engine.standard import StandardEngine
 
     torch.set_num_threads(a.threads)
     text = a.text.read_text(encoding="utf-8")
     t0 = time.perf_counter()
-    engine = StandardEngine.load(a.checkpoint, dtype=torch.float32, max_seq_len=a.ctx,
-                                 ternary_backend=a.ternary_backend)
+    model_type = json.loads((a.checkpoint / "config.json").read_text()).get("model_type")
+    if model_type in ("llama", "olmoe"):
+        engine = StandardEngine.load(a.checkpoint, dtype=torch.float32, max_seq_len=a.ctx,
+                                     ternary_backend=a.ternary_backend)
+        def window_logits(chunk):
+            return engine.model.forward(chunk)[0]
+    else:  # DeepSeek V4.1 (any mode) through the main engine
+        engine = Engine.load(a.checkpoint, max_seq_len=a.ctx)
+        def window_logits(chunk):
+            return engine.trace(chunk).logits
     load_s = time.perf_counter() - t0
     ids = engine.tokenizer.encode(text, add_special_tokens=False).ids
     windows = len(ids) // a.ctx
@@ -58,7 +67,7 @@ def main(argv=None) -> int:
     t0 = time.perf_counter()
     for w in range(start, windows):
         chunk = torch.tensor([ids[w * a.ctx:(w + 1) * a.ctx]], dtype=torch.long)
-        logits, _, _ = engine.model.forward(chunk)
+        logits = window_logits(chunk)
         lp = F.log_softmax(logits[0, first:-1].float(), dim=-1)
         target = chunk[0, first + 1:]
         nll -= float(lp.gather(-1, target[:, None]).sum())
