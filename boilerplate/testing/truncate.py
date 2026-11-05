@@ -24,12 +24,15 @@ import json
 import re
 import struct
 import urllib.request
+from urllib.parse import quote
 from pathlib import Path
 
 import torch
 from safetensors.torch import save_file
 
 from ..engine.weights import ST_DTYPES
+from ..checkpoint.paths import checkpoint_filename, checkpoint_path
+from ..checkpoint.safetensors_io import MAX_HEADER_BYTES, parse_header_metadata
 
 HUB = "https://huggingface.co/{repo}/resolve/{rev}/{file}"
 
@@ -104,6 +107,11 @@ class _Reader:
         self.source, self.revision = source, revision
         self.local = Path(source).exists()
 
+    def _url(self, file: str) -> str:
+        checkpoint_filename(file)
+        return HUB.format(repo=quote(self.source, safe="/"), rev=quote(self.revision, safe=""),
+                          file=quote(file, safe="/"))
+
     def read(self, file: str, start: int, end: int) -> bytes:
         if start < 0 or end < start:
             raise ValueError("invalid byte range")
@@ -111,13 +119,13 @@ class _Reader:
         if not expected:
             return b""
         if self.local:
-            with open(Path(self.source) / file, "rb") as f:
+            with checkpoint_path(self.source, file).open("rb") as f:
                 f.seek(start)
                 data = f.read(expected)
             if len(data) != expected:
                 raise IOError(f"short read {len(data)} != {expected}")
             return data
-        url = HUB.format(repo=self.source, rev=self.revision, file=file)
+        url = self._url(file)
         for attempt in range(5):
             try:
                 req = urllib.request.Request(url, headers={"Range": f"bytes={start}-{end - 1}"})
@@ -144,13 +152,20 @@ class _Reader:
 
     def text(self, file: str) -> str:
         if self.local:
-            return (Path(self.source) / file).read_text()
-        with urllib.request.urlopen(HUB.format(repo=self.source, rev=self.revision, file=file), timeout=120) as r:
-            return r.read().decode()
+            with checkpoint_path(self.source, file).open("rb") as f:
+                raw = f.read(MAX_HEADER_BYTES + 1)
+        else:
+            with urllib.request.urlopen(self._url(file), timeout=120) as r:
+                raw = r.read(MAX_HEADER_BYTES + 1)
+        if len(raw) > MAX_HEADER_BYTES:
+            raise ValueError("checkpoint metadata exceeds the size limit")
+        return raw.decode("utf-8")
 
     def header(self, file: str) -> tuple[int, dict]:
         (n,) = struct.unpack("<Q", self.read(file, 0, 8))
-        return 8 + n, json.loads(self.read(file, 8, 8 + n))
+        if not 0 < n <= MAX_HEADER_BYTES:
+            raise ValueError("implausible safetensors header length")
+        return 8 + n, parse_header_metadata(self.read(file, 8, 8 + n))
 
 
 def make_truncated(

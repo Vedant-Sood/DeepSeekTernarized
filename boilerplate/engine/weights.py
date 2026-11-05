@@ -11,13 +11,15 @@ from __future__ import annotations
 
 import json
 import math
-import struct
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
+
+from ..checkpoint.paths import checkpoint_path
+from ..checkpoint.safetensors_io import read_header_metadata
 
 ST_DTYPES = {
     "F64": torch.float64,
@@ -62,10 +64,7 @@ class TensorRef:
 class _Shard:
     def __init__(self, path: Path):
         self.path = path
-        with path.open("rb") as f:
-            (n,) = struct.unpack("<Q", f.read(8))
-            header = json.loads(f.read(n))
-        self.data_start = 8 + n
+        self.data_start, header = read_header_metadata(path)
         self.meta = {k: v for k, v in header.items() if k != "__metadata__"}
         self._bytes: torch.Tensor | None = None
 
@@ -104,18 +103,18 @@ class WeightStore:
         self.mode_b_cache_misses = 0
         self.mode_b_cache_evictions = 0
         self._mode_b_cache: OrderedDict[tuple[str, int, int], torch.Tensor] = OrderedDict()
-        index = self.root / "model.safetensors.index.json"
-        files = sorted({*json.loads(index.read_text())["weight_map"].values()}) if index.exists() else [
+        index = checkpoint_path(self.root, "model.safetensors.index.json")
+        files = list(json.loads(index.read_text())["weight_map"].values()) if index.exists() else [
             p.name for p in sorted(self.root.glob("*.safetensors"))
         ]
-        self.shards = [_Shard(self.root / f) for f in files]
+        self.shards = [_Shard(path) for path in sorted({checkpoint_path(self.root, f) for f in files})]
         self.where: dict[str, _Shard] = {}
         for s in self.shards:
             for n in s.meta:
                 self.where[n] = s
         # Boilerplate-format directories carry a manifest: per weight base name its mode
         # (A original, B entropy-coded, C stacked ternary) and how it is stored
-        mpath = self.root / "manifest.json"
+        mpath = checkpoint_path(self.root, "manifest.json")
         self.manifest: dict | None = json.loads(mpath.read_text()) if mpath.exists() else None
         self.coded: dict[str, dict] = {}  # Mode B: original tensor name -> coding info
         self.coded_params: dict[str, tuple[int, int]] = {}
