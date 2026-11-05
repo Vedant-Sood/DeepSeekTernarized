@@ -365,6 +365,18 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--expert-cache-mib", type=int, help="bound on materialized routed experts (default: keep all)")
     s.set_defaults(fn=_cmd_bench)
 
+    s = sub.add_parser("serve", help="OpenAI-compatible HTTP server (/v1/completions, /v1/chat/completions, streaming)")
+    s.add_argument("checkpoint")
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8000)
+    s.add_argument("--name", help="model id reported by /v1/models (default: the directory name)")
+    s.add_argument("--max-seq-len", type=int, default=4096)
+    s.add_argument("--default-max-tokens", type=int, default=256)
+    s.add_argument("--threads", type=int, default=4, help="PyTorch CPU math threads")
+    s.add_argument("--mode-b-cache-mib", type=int, default=256, help="maximum decoded Mode B bytes retained in the LRU (MiB)")
+    s.add_argument("--expert-cache-mib", type=int, help="bound on materialized routed experts (default: keep all)")
+    s.set_defaults(fn=lambda a: __import__("boilerplate.serve", fromlist=["main"]).main(a))
+
     s = sub.add_parser("compare", help="compare two traces layer by layer")
     s.add_argument("reference")
     s.add_argument("candidate")
