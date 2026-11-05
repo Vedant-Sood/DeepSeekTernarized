@@ -334,7 +334,7 @@ class V4Model:
                 E.index = self.engram_layout.layer_ids.index(i)
                 tm = W.mode_of(f"{e}.embed")
                 E.coded_table = f"{e}.embed" if f"{e}.embed.weight" in W.coded else None
-                if tm["mode"] == "C":  # ternary lookup table: rows are dequantized on lookup
+                if tm["mode"] in ("C", "D"):  # ternary lookup table: rows are dequantized on lookup
                     E.table = None
                     E.tq = [(g(f"{e}.embed.tq{i}.packed"), g(f"{e}.embed.tq{i}.scale")) for i in range(tm["terms"])]
                     E.tq_fmt, E.tq_group, E.tq_K = tm["packing"], tm["group"], tm["shape"][1]
@@ -355,7 +355,7 @@ class V4Model:
     def linear(self, base: str):
         """The linear for a weight base name, in whatever mode the checkpoint stores it."""
         m = self.w.mode_of(base)
-        if m["mode"] == "C":
+        if m["mode"] in ("C", "D"):
             terms = [PackedTerm(self.w.get(f"{base}.tq{i}.packed"), self.w.get(f"{base}.tq{i}.scale")) for i in range(m["terms"])]
             lin = TernaryLinear(terms, m["shape"][1], m["packing"], m["group"], act=m.get("act", "int8"), backend=self.ternary_backend)
         else:  # A, or B (WeightStore decodes B back to the original bytes)

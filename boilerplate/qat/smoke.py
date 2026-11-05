@@ -36,44 +36,7 @@ def tiny_model(kind: str, seed: int = 5):
     return transformers.OlmoeForCausalLM(config).float()
 
 
-def unfuse_experts(model) -> None:
-    """Recent transformers stores OLMoE experts as fused 3-D parameters. Rebuild them as one
-    ``nn.Linear`` per expert projection (the published checkpoint layout), so BitLinear can wrap them."""
-    from torch import nn
-
-    for layer in getattr(model.model, "layers", []):
-        experts = getattr(layer.mlp, "experts", None)
-        if experts is None or not hasattr(experts, "gate_up_proj"):
-            continue
-        gate_up, down = experts.gate_up_proj.data, experts.down_proj.data  # [E, 2I, H], [E, H, I]
-        n = gate_up.size(0)
-        inter = gate_up.size(1) // 2
-
-        class Expert(nn.Module):
-            def __init__(self, gu, d):
-                super().__init__()
-                g, u = gu.chunk(2, 0)
-                self.gate_proj = nn.Linear(g.size(1), inter, bias=False)
-                self.up_proj = nn.Linear(u.size(1), inter, bias=False)
-                self.down_proj = nn.Linear(inter, d.size(0), bias=False)
-                with torch.no_grad():
-                    self.gate_proj.weight.copy_(g)
-                    self.up_proj.weight.copy_(u)
-                    self.down_proj.weight.copy_(d)
-
-            def forward(self, x):
-                return self.down_proj(nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
-
-        class Experts(nn.ModuleList):
-            def forward(self, hidden, top_k_index, top_k_weights):
-                out = torch.zeros_like(hidden)
-                for e, expert in enumerate(self):
-                    token, slot = torch.where(top_k_index == e)
-                    if token.numel():
-                        out.index_add_(0, token, expert(hidden[token]) * top_k_weights[token, slot, None].to(hidden.dtype))
-                return out
-
-        layer.mlp.experts = Experts([Expert(gate_up[e], down[e]) for e in range(n)])
+from .model import unfuse_experts  # noqa: E402  (re-exported for the tests)
 
 
 def _batch(rank: int, step: int, batch: int, seq: int, vocab: int) -> torch.Tensor:

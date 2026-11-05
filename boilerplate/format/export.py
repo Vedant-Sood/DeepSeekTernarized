@@ -11,6 +11,8 @@ Output directory:
     2-byte dtypes, ``T.hraw`` (the uncoded low bytes). See ``entropy.py`` for the stream layout.
   - Mode C: ``X.tq{i}.packed`` (uint8, TQ2/TQ1 rows, see ``ternary/pack.py``) and ``X.tq{i}.scale``
     ([N, ceil(K / group)], FP16/BF16) for each term i.
+  - Mode D: stored exactly like Mode C with one term, quantized with the absmean rule that QAT
+    trains against (``boilerplate.qat.export`` writes it from a trained model).
   Supported one- and two-byte tensors outside a weight/scale pair can also use Mode B;
   other non-weight tensors stay in their original format.
 * ``manifest.json``: format version, architecture (the source config), policy, and per weight:
@@ -168,7 +170,7 @@ def export(
         params = logical_numel(w, fp4)
         meta = {"mode": rule.mode, "shape": [w.size(0), w.size(1) * (2 if fp4 else 1)] if w.ndim == 2 else list(w.shape),
                 "source_dtype": "fp4_e2m1" if fp4 else str(w.dtype).replace("torch.", "")}
-        if rule.mode == "C" and w.ndim == 2:
+        if rule.mode in ("C", "D") and w.ndim == 2:
             src_bits = 8 * sum(ws.get(n).numel() * ws.get(n).element_size() for n in tnames) / params
             if rule.effective_bits() >= MAX_RATIO * src_bits and not rule.allow_larger:
                 raise ValueError(

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-MODES = ("A", "B", "C")
+MODES = ("A", "B", "C", "D")  # D: QAT-trained single ternary term (exported with the absmean quantizer)
 MAX_RATIO = 0.85
 
 
@@ -38,7 +38,10 @@ class Rule:
         self.regex = re.compile(self.match)
         if self.mode not in MODES:
             raise ValueError(f"mode {self.mode!r}: expected one of {MODES}")
-        if self.mode == "C":
+        if self.mode == "D":
+            # Mode D stores what QAT trained against: one absmean term, no GPTQ.
+            self.k, self.fit, self.gptq = 1, "absmean", False
+        if self.mode in ("C", "D"):
             if not 1 <= self.k <= 4:
                 raise ValueError("k must be 1..4")
             if self.packing not in ("tq2", "tq1"):
