@@ -65,7 +65,11 @@ def shard(model: nn.Module, block_pattern: str = r"layers\.\d+$", **fsdp_kwargs)
 
 
 def _rng_state(generator: torch.Generator | None) -> dict:
-    return {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
+    # NumPy's state holds an ndarray, whose pickle needs arbitrary globals; store its keys as a
+    # tensor so the rank file loads with torch.load(weights_only=True), as in qat/checkpoint.py.
+    numpy_rng = np.random.get_state()
+    numpy_rng = (numpy_rng[0], torch.from_numpy(numpy_rng[1].astype(np.int64)), *numpy_rng[2:])
+    return {"python": random.getstate(), "numpy": numpy_rng, "torch": torch.get_rng_state(),
             "generator": generator.get_state() if generator is not None else None}
 
 
@@ -81,7 +85,7 @@ def save_sharded(path: str | Path, model: nn.Module, optimizer: torch.optim.Opti
     levels = {name: m.level for name, m in model.named_modules() if isinstance(m, BitLinear)}
     dcp.save({"model": model_state, "optimizer": optim_state}, checkpoint_id=str(path / "state"))
     rank = dist.get_rank() if dist.is_initialized() else 0
-    torch.save({"step": step, "tokens_seen": tokens_seen, "trainer_state": trainer_state or {},
+    torch.save({"version": 2, "step": step, "tokens_seen": tokens_seen, "trainer_state": trainer_state or {},
                 "levels": levels, "rng": _rng_state(generator)}, path / f"rank{rank:05d}.pt")
     if dist.is_initialized():
         dist.barrier()
@@ -90,7 +94,12 @@ def save_sharded(path: str | Path, model: nn.Module, optimizer: torch.optim.Opti
 
 def load_sharded(path: str | Path, model: nn.Module, optimizer: torch.optim.Optimizer, *,
                  generator: torch.Generator | None = None) -> dict:
-    """Collective inverse of :func:`save_sharded` on the same world size. Trusted files only."""
+    """Collective inverse of :func:`save_sharded` on the same world size.
+
+    The per-rank file is read with PyTorch's restricted weights-only unpickler, so it cannot run
+    pickled code. Version 1 rank files (NumPy pickle globals) must be recreated; there is no
+    unrestricted fallback. The DCP shards themselves are tensor data read by torch.distributed.
+    """
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 
@@ -100,15 +109,21 @@ def load_sharded(path: str | Path, model: nn.Module, optimizer: torch.optim.Opti
     dcp.load(state, checkpoint_id=str(path / "state"))
     set_state_dict(model, optimizer, model_state_dict=state["model"], optim_state_dict=state["optimizer"])
     rank = dist.get_rank() if dist.is_initialized() else 0
-    local = torch.load(path / f"rank{rank:05d}.pt", weights_only=False)
+    local = torch.load(path / f"rank{rank:05d}.pt", map_location="cpu", weights_only=True)
+    if not isinstance(local, dict) or local.get("version") != 2:
+        raise ValueError("unsupported distributed checkpoint version (recreate version 1 checkpoints)")
     modules = dict(model.named_modules())
+    unknown = [name for name in local["levels"] if not isinstance(modules.get(name), BitLinear)]
+    if unknown:
+        raise ValueError(f"checkpoint levels name modules that are not BitLinear: {unknown[:3]}")
     for name, level in local["levels"].items():
         modules[name].set_quantization_level(level)
     rng = local["rng"]
     if (rng["generator"] is None) != (generator is None):
         raise ValueError("checkpoint and caller must both supply the optional generator")
     random.setstate(rng["python"])
-    np.random.set_state(rng["numpy"])
+    numpy_rng = rng["numpy"]
+    np.random.set_state((numpy_rng[0], numpy_rng[1].numpy().astype(np.uint32), *numpy_rng[2:]))
     torch.set_rng_state(rng["torch"])
     if generator is not None:
         generator.set_state(rng["generator"])

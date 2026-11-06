@@ -21,6 +21,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 
+#include <algorithm>
 #include <cstdint>
 
 namespace {
@@ -112,10 +113,28 @@ void ternary_grouped_gemm_cuda(torch::Tensor out, torch::Tensor x, torch::Tensor
   TORCH_CHECK(packed.dim() == 3 && w_scale.dim() == 3 && x.dim() == 2 && out.dim() == 2, "bad ranks");
   TORCH_CHECK(fmt == 1 || fmt == 2, "fmt must be 1 (TQ1) or 2 (TQ2)");
   const int64_t E = packed.size(0), N = packed.size(1), Kp = packed.size(2), G = w_scale.size(2);
-  TORCH_CHECK(x.size(1) == K && Kp * (fmt == 2 ? 4 : 5) >= K && G * group >= K && offsets.numel() == E + 1,
-              "inconsistent ternary GEMM shapes");
+  const int64_t per = fmt == 2 ? 4 : 5;
+  // Exact sizes, as in the CPU kernel: anything looser lets the kernel index past a buffer.
+  TORCH_CHECK(K > 0 && K <= (int64_t{1} << 40) && group > 0 && group <= (int64_t{1} << 24),
+              "invalid ternary GEMM K or group");  // 127 * group fits the int32 accumulator
+  TORCH_CHECK(x.size(1) == K && Kp == K / per + (K % per != 0) && G == K / group + (K % group != 0) &&
+              w_scale.size(0) == E && w_scale.size(1) == N && offsets.dim() == 1 && offsets.numel() == E + 1 &&
+              lut1.numel() >= 256 * 5, "inconsistent ternary GEMM shapes");
   TORCH_CHECK(out.size(0) == x.size(0) && out.size(1) == N && x_scale.numel() == x.size(0), "bad output shape");
+  TORCH_CHECK(E <= 65535, "too many experts for one launch (grid y limit)");
+  // offsets drive every row index in the kernel: validate them on the host (E + 1 values).
+  const auto offs = offsets.to(torch::kCPU);
+  const int64_t* o = offs.data_ptr<int64_t>();
+  int64_t widest = 0;
+  TORCH_CHECK(o[0] == 0 && o[E] == x.size(0), "offsets must start at 0 and end at the row count");
+  for (int64_t e = 0; e < E; ++e) {
+    TORCH_CHECK(o[e + 1] >= o[e], "offsets must be nondecreasing");
+    widest = std::max(widest, o[e + 1] - o[e]);
+  }
+  TORCH_CHECK(max_rows >= widest, "max_rows is smaller than the largest expert row count");
+  max_rows = widest;
   if (max_rows <= 0 || N == 0) return;
+  TORCH_CHECK((max_rows + TOK_TILE - 1) / TOK_TILE <= 65535, "too many rows per expert for one launch");
   c10::cuda::CUDAGuard guard(out.device());
   const dim3 grid((N + WARPS - 1) / WARPS, E, (max_rows + TOK_TILE - 1) / TOK_TILE);
   auto stream = c10::cuda::getCurrentCUDAStream();
