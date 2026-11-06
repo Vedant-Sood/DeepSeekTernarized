@@ -153,3 +153,74 @@ def test_http_round_trip(server):
     finally:
         srv.should_exit = True
         thread.join(timeout=10)
+
+
+def test_chat_template_is_sandboxed(server):
+    # A malicious tokenizer_config.json chat template must not reach Python internals.
+    evil = Server(server.engine, "tiny", chat_template=(
+        "{{ messages.__class__.__mro__[1].__subclasses__() }}"))
+    with pytest.raises(RequestError, match="unsafe|template"):
+        evil.chat_prompt([{"role": "user", "content": "w1"}])
+    mutating = Server(server.engine, "tiny", chat_template="{{ messages.append(1) }}")
+    with pytest.raises(RequestError):
+        mutating.chat_prompt([{"role": "user", "content": "w1"}])
+    raising = Server(server.engine, "tiny", chat_template="{{ raise_exception('no system role') }}")
+    with pytest.raises(RequestError, match="no system role"):
+        raising.chat_prompt([{"role": "user", "content": "w1"}])
+
+
+@pytest.mark.parametrize("body,match", [
+    ({"prompt": "w1", "max_tokens": True}, "max_tokens"),
+    ({"prompt": "w1", "n": True}, "`n`"),
+    ({"prompt": "w1", "seed": "7"}, "seed"),
+    ({"prompt": "w1", "seed": -1}, "seed"),
+    ({"prompt": "w1", "stop": 5}, "stop"),
+    ({"prompt": "w1", "stop": "x" * 1000}, "stop"),
+    ({"prompt": "w1", "temperature": False}, "temperature"),
+])
+def test_rejects_malformed_parameters(server, body, match):
+    with pytest.raises(RequestError, match=match):
+        server.complete(body)
+
+
+def test_prompt_length_is_bounded_before_tokenizing(server):
+    small = Server(server.engine, "tiny", max_prompt_chars=16)
+    with pytest.raises(RequestError, match="longer than"):
+        small.complete({"prompt": "w1 " * 100, "max_tokens": 1})
+    with pytest.raises(RequestError, match="longer than"):
+        small.complete({"messages": [{"role": "user", "content": "w1 " * 100}], "max_tokens": 1}, chat=True)
+
+
+def test_http_auth_body_limit_and_busy(server):
+    pytest.importorskip("starlette")
+    from starlette.testclient import TestClient
+
+    from boilerplate.serve import app, is_loopback
+
+    client = TestClient(app(server, api_key="s3cret", max_body_bytes=256))
+    assert client.get("/health").status_code == 200  # liveness stays open
+    assert client.get("/v1/models").status_code == 401
+    assert client.get("/stats", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    r = client.post("/v1/completions", json={"prompt": "w1", "max_tokens": 1})
+    assert r.status_code == 401 and r.headers["www-authenticate"] == "Bearer"
+    auth = {"Authorization": "Bearer s3cret"}
+    assert client.get("/v1/models", headers=auth).status_code == 200
+    ok = client.post("/v1/completions", json={"prompt": "w1", "max_tokens": 2, "temperature": 0}, headers=auth)
+    assert ok.status_code == 200
+    big = client.post("/v1/completions", json={"prompt": "w1 " * 200, "max_tokens": 1}, headers=auth)
+    assert big.status_code == 413
+    busy = TestClient(app(server, max_pending=0))
+    assert busy.post("/v1/completions", json={"prompt": "w1", "max_tokens": 1}).status_code == 503
+    assert is_loopback("127.0.0.1") and is_loopback("::1") and is_loopback("localhost")
+    assert not is_loopback("0.0.0.0") and not is_loopback("192.168.1.5")
+
+
+def test_main_refuses_public_bind_without_key(monkeypatch):
+    import argparse
+
+    from boilerplate import serve
+
+    monkeypatch.delenv("BOILERPLATE_API_KEY", raising=False)
+    a = argparse.Namespace(host="0.0.0.0", api_key=None, insecure_no_auth=False)
+    with pytest.raises(SystemExit, match="without an API key"):
+        serve.main(a)
