@@ -30,6 +30,25 @@ class TernaryTerm:
     scale: torch.Tensor  # [N, G] fp16/bf16
 
 
+@torch.no_grad()
+def absmean_ternary(weight: torch.Tensor, group: int, scale_dtype: torch.dtype = torch.float16) -> TernaryTerm:
+    """Absmean ternary quantization per output row and input group, including short groups."""
+    if weight.ndim != 2 or group <= 0 or weight.size(1) == 0:
+        raise ValueError("weight must be a matrix with a nonempty input dimension and positive group")
+    if scale_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("scale_dtype must be float16 or bfloat16")
+    rows, columns = weight.shape
+    groups = math.ceil(columns / group)
+    data = torch.nn.functional.pad(weight.float(), (0, groups * group - columns)).view(rows, groups, group)
+    counts = torch.full((groups,), group, dtype=torch.float32, device=weight.device)
+    counts[-1] = columns - (groups - 1) * group
+    # Quantize with the scale as stored so QAT and the packed engine agree.
+    scale = (data.abs().sum(-1) / counts).to(scale_dtype)
+    scale_f32 = scale.float().unsqueeze(-1)
+    trits = torch.where(scale_f32 > 0, torch.round(data / scale_f32.clamp_min(1e-30)).clamp(-1, 1), 0)
+    return TernaryTerm(trits.to(torch.int8).view(rows, -1)[:, :columns].contiguous(), scale)
+
+
 def _grouped(x: torch.Tensor, group: int) -> torch.Tensor:
     N, K = x.shape
     pad = -K % group
@@ -108,8 +127,11 @@ def _quant_column(w: torch.Tensor, scales: list[torch.Tensor]) -> list[torch.Ten
     return out
 
 
-def fit_gptq(w: torch.Tensor, H: torch.Tensor, k: int, group: int = 128, damp: float = 0.01, scale_dtype=torch.float16) -> list[TernaryTerm]:
+def fit_gptq(w: torch.Tensor, H: torch.Tensor, k: int, group: int = 128, damp: float = 0.01,
+             scale_dtype=torch.float16, quantizer: str = "residual") -> list[TernaryTerm]:
     """GPTQ with stacked ternary terms. w: [N, K]; H: [K, K] = X^T X over calibration inputs."""
+    if quantizer not in ("residual", "absmean") or (quantizer == "absmean" and k != 1):
+        raise ValueError("GPTQ quantizer must be residual or single-term absmean")
     W = w.float().clone()
     N, K = W.shape
     H = H.float().clone()
@@ -125,7 +147,8 @@ def fit_gptq(w: torch.Tensor, H: torch.Tensor, k: int, group: int = 128, damp: f
         i2 = min(i1 + group, K)
         gi = i1 // group
         # scales for this group, from the (already error-compensated) weights entering it
-        gterms = fit_residual(W[:, i1:i2], k, group, scale_dtype)
+        gterms = ([absmean_ternary(W[:, i1:i2], group, scale_dtype)] if quantizer == "absmean"
+                  else fit_residual(W[:, i1:i2], k, group, scale_dtype))
         for t, gt in enumerate(gterms):
             scales[t][:, gi] = gt.scale[:, 0]
         col_scales = [s[:, gi] for s in scales]

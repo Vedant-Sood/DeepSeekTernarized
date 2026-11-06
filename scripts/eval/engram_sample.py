@@ -1,18 +1,16 @@
 """Sample random row ranges of the real engram tables (weight FP8 + e8m0 scales) via HTTP range requests."""
-import json, os, struct, random, urllib.request
+import json, struct, random
 import torch
 from safetensors.torch import save_file
-REPO = "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/resolve/main/"
-tok = open(os.path.expanduser("~/.cache/huggingface/token")).read().strip() if os.path.exists(os.path.expanduser("~/.cache/huggingface/token")) else None
-def get(url, a, b):
-    req = urllib.request.Request(url, headers={"Range": f"bytes={a}-{b - 1}", **({"Authorization": f"Bearer {tok}"} if tok else {})})
-    return urllib.request.urlopen(req, timeout=120).read()
+from boilerplate.testing.truncate import _Reader
+reader = _Reader("deepseek-ai/DeepSeek-V4.1-Flash-1017")
+get = reader.read  # Validate ranges; do not forward cached credentials for this public model.
 h = json.load(open("/home/user/work/real_headers.json"))
 random.seed(0)
 ROWS, SLICES = 4096, 32
 for layer in (1, 14):
     w = h[f"layers.{layer}.engram.embed.weight"]; s = h[f"layers.{layer}.engram.embed.scale"]
-    url = REPO + w[2]
+    url = w[2]
     (n,) = struct.unpack("<Q", get(url, 0, 8)); base = 8 + n
     N = w[1][0]
     ws, ss, rows = [], [], []

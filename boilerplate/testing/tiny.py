@@ -36,7 +36,9 @@ TINY_TEXT_CONFIG = {
     "model_type": "deepseek_v41_text",
     "vocab_size": 512,
     "hidden_size": 128,
-    "moe_intermediate_size": 64,
+    # A 128-column expert down projection keeps TQ1 k=2 below the 0.85x FP4 size guard
+    # even after row packing and scale padding are counted.
+    "moe_intermediate_size": 128,
     "num_hidden_layers": 8,
     "num_attention_heads": 4,
     "num_key_value_heads": 1,

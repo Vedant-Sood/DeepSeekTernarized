@@ -203,9 +203,10 @@ def export(
                 "source_dtype": "fp4_e2m1" if fp4 else str(w.dtype).replace("torch.", "")}
         if rule.mode in ("C", "D") and w.ndim == 2:
             src_bits = 8 * sum(ws.get(n).numel() * ws.get(n).element_size() for n in tnames) / params
-            if rule.effective_bits() >= MAX_RATIO * src_bits and not rule.allow_larger:
+            effective_bits = rule.effective_bits(meta["shape"][1])
+            if effective_bits >= MAX_RATIO * src_bits and not rule.allow_larger:
                 raise ValueError(
-                    f"{base}: Mode C {rule.packing} k={rule.k} group={rule.group} is {rule.effective_bits():.3f} bits/weight, "
+                    f"{base}: Mode C {rule.packing} k={rule.k} group={rule.group} is {effective_bits:.3f} bits/weight, "
                     f"not below {MAX_RATIO} x the source's {src_bits:.3f}; lower k, use tq1, or set allow_larger"
                 )
             meta["source_bits"] = src_bits
@@ -218,8 +219,9 @@ def export(
                 gptq = False
                 meta["gptq_fallback"] = "too few calibration tokens"
             if gptq:
-                terms = fit_gptq(W, hessians[base], rule.k, rule.group, scale_dtype=SCALE_DTYPES[rule.scale_dtype])
-            elif rule.fit == "absmean":
+                terms = fit_gptq(W, hessians[base], rule.k, rule.group, scale_dtype=SCALE_DTYPES[rule.scale_dtype],
+                                 quantizer=rule.quantizer)
+            elif rule.quantizer == "absmean":
                 terms = [absmean_ternary(W, rule.group, SCALE_DTYPES[rule.scale_dtype])]
             else:
                 terms = fit_residual(W, rule.k, rule.group, SCALE_DTYPES[rule.scale_dtype])
@@ -227,7 +229,8 @@ def export(
             for i, t in enumerate(terms):
                 stored[f"{base}.tq{i}.packed"] = pack(t.trits, rule.packing)
                 stored[f"{base}.tq{i}.scale"] = t.scale
-            meta.update(packing=rule.packing, terms=rule.k, group=rule.group, scale_dtype=rule.scale_dtype, act=rule.act, gptq=gptq, fit=rule.fit)
+            meta.update(packing=rule.packing, terms=rule.k, group=rule.group, scale_dtype=rule.scale_dtype,
+                        act=rule.act, gptq=gptq, fit=rule.fit, quantizer=rule.quantizer)
             record(base, meta, stored, params)
         elif rule.mode == "B":
             stored, parts_meta = encode_lossless(tnames)

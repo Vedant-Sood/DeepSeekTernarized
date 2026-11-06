@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .safetensors_io import TensorInfo, read_header, read_remote_headers
+from .paths import checkpoint_path
 
 
 @dataclass
@@ -35,8 +36,8 @@ class CheckpointSource:
 
     @classmethod
     def _open_local(cls, root: Path, read_headers: bool) -> "CheckpointSource":
-        config = json.loads((root / "config.json").read_text())
-        index_path = root / "model.safetensors.index.json"
+        config = json.loads(checkpoint_path(root, "config.json").read_text())
+        index_path = checkpoint_path(root, "model.safetensors.index.json")
         shards = sorted(root.glob("*.safetensors"))
         if index_path.exists():
             weight_map = json.loads(index_path.read_text())["weight_map"]
@@ -44,13 +45,16 @@ class CheckpointSource:
             # single-file checkpoint: build the map from headers
             weight_map = {}
             for s in shards:
-                for name in read_header(s):
+                for name in read_header(checkpoint_path(root, s.name)):
                     weight_map[name] = s.name
         headers = None
         if read_headers:
             headers = {}
             for s in sorted(set(weight_map.values())):
-                headers.update(read_header(root / s))
+                headers.update(read_header(checkpoint_path(root, s)))
+        # Validate index filenames even when callers requested no shard headers.
+        for filename in weight_map.values():
+            checkpoint_path(root, filename)
         sizes = {s.name: s.stat().st_size for s in shards}
         return cls(str(root), config, weight_map, headers, sizes, True)
 

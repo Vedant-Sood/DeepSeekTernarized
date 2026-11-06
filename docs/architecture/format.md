@@ -33,14 +33,18 @@ rules:
     scale_dtype: fp16
     act: int8        # int8 per-token absmax activations into the layer | bf16
     gptq: false      # GPTQ error compensation (needs --calib-text at export)
+    quantizer: residual  # residual fit | absmean (single term only)
     allow_larger: false
 ```
 
-A Mode C setting costs `k * (bits(packing) + 16 / group)` bits per weight. The exporter compares
-that with what the source tensor actually uses, including its scales, and refuses a setting that
-is not below 0.85x the source unless `allow_larger: true`. V4.1's routed experts are FP4 with one
+A Mode C setting costs approximately `k * (bits(packing) + 16 / group)` bits per weight. For
+`K` input columns, the exporter uses the exact per-row cost
+`8 * k * (ceil(K / trits_per_byte) + 2 * ceil(K / group)) / K`, including row and scale-group
+padding. It compares that with what the source tensor actually uses, including its scales, and
+refuses a setting that is not below 0.85x the source unless `allow_larger: true` is used for a
+clearly labelled side experiment. V4.1's routed experts are FP4 with one
 e8m0 scale per 32 weights, so they use 4.25 b/w. TQ2 k=2 costs 4.25 b/w too, so it is refused.
-TQ1 k=2 costs 3.45 b/w and is allowed.
+TQ1 k=2 costs approximately 3.45 b/w and is allowed.
 
 Shipped policies (`configs/policy/`):
 
@@ -51,6 +55,8 @@ Shipped policies (`configs/policy/`):
 | `experts_engram_k2.yaml` | routed experts and both engram tables, TQ1 k=2 | 3.45 |
 | `lossless.yaml` | supported tensors Mode B; wider tensors unchanged | n/a |
 | `experts_k2_lossless_rest.yaml` | routed experts Mode C; other supported tensors Mode B | 3.45 for experts |
+| `standard_absmean_tq{1,2}[_gptq].yaml` | Llama/OLMoE block linears, absmean k=1 | depends on row padding |
+| `standard_k2_tq1[_gptq].yaml` | Llama/OLMoE block linears, residual k=2 | depends on row padding |
 
 ## Stored tensors per mode
 

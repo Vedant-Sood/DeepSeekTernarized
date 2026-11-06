@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=84.1.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -38,7 +38,7 @@ boilerplate = "boilerplate.cli:main"
 include = ["boilerplate*"]
 
 [tool.setuptools.package-data]
-boilerplate = ["kernels/csrc/*.cpp", "kernels/csrc/*.cu"]
+boilerplate = ["kernels/csrc/*.cpp", "kernels/csrc/*.cu", "kernels/csrc/*.h"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

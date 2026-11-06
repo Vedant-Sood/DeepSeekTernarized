@@ -29,10 +29,22 @@ MAXLEN = 12
 BLOCK = 4096
 
 
+def _parameters(maxlen: int, block: int = BLOCK) -> None:
+    if type(maxlen) is not int or not 1 <= maxlen <= MAXLEN:
+        raise ValueError(f"maxlen must be in 1..{MAXLEN}")
+    if type(block) is not int or block <= 0:
+        raise ValueError("block must be positive")
+
+
 def code_lengths(freq: torch.Tensor, maxlen: int = MAXLEN) -> torch.Tensor:
     """Huffman code lengths for 256 symbol counts, limited to maxlen bits."""
+    _parameters(maxlen)
+    if freq.shape != (256,) or freq.is_floating_point() or torch.any(freq < 0):
+        raise ValueError("expected 256 nonnegative integer symbol counts")
     f = [int(v) for v in freq.tolist()]
     syms = [s for s in range(256) if f[s] > 0]
+    if len(syms) > 1 << maxlen:
+        raise ValueError("maxlen cannot represent all used symbols")
     lens = [0] * 256
     if len(syms) == 1:
         lens[syms[0]] = 1
@@ -63,11 +75,15 @@ def code_lengths(freq: torch.Tensor, maxlen: int = MAXLEN) -> torch.Tensor:
 
 
 def canonical_codes(lens: torch.Tensor) -> torch.Tensor:
+    if lens.shape != (256,) or lens.dtype != torch.uint8 or torch.any(lens > MAXLEN):
+        raise ValueError("expected 256 uint8 code lengths in 0..12")
     L = lens.tolist()
     codes = [0] * 256
     code, prev = 0, 0
     for s in sorted((s for s in range(256) if L[s] > 0), key=lambda s: (L[s], s)):
         code <<= L[s] - prev
+        if code >= 1 << L[s]:
+            raise ValueError("oversubscribed Huffman code lengths")
         codes[s] = code
         code += 1
         prev = L[s]
@@ -75,8 +91,11 @@ def canonical_codes(lens: torch.Tensor) -> torch.Tensor:
 
 
 def decode_table(lens: torch.Tensor, maxlen: int) -> torch.Tensor:
+    _parameters(maxlen)
     codes = canonical_codes(lens).tolist()
     L = lens.tolist()
+    if max(L) > maxlen:
+        raise ValueError("Huffman code length exceeds maxlen")
     lut = torch.zeros(1 << maxlen, dtype=torch.int32)
     for s in range(256):
         if L[s]:
@@ -111,6 +130,7 @@ def join_bytes(sym: torch.Tensor, raw: torch.Tensor | None) -> torch.Tensor:
 
 
 def encode(t: torch.Tensor, maxlen: int = MAXLEN, block: int = BLOCK) -> dict[str, torch.Tensor]:
+    _parameters(maxlen, block)
     e = ext()
     if e is None:
         raise RuntimeError("Mode B encoding needs the C++ extension")
@@ -131,8 +151,18 @@ def decode(parts: dict[str, torch.Tensor], n_symbols: int, maxlen: int = MAXLEN,
     unchanged. CUDA uses the optional GPU extension when available. Without that extension,
     decoding falls back to CPU and copies the result back to the input device.
     """
+    _parameters(maxlen, block)
+    if type(n_symbols) is not int or n_symbols < 0:
+        raise ValueError("n_symbols must be nonnegative")
+    for name, dtype in (("stream", torch.uint8), ("offsets", torch.int64), ("lens", torch.uint8)):
+        if parts[name].dtype != dtype or parts[name].ndim != 1:
+            raise ValueError(f"invalid Huffman {name} dtype or rank")
+    if parts["stream"].numel() < 4 or n_symbols > (parts["stream"].numel() - 3) * 8:
+        raise ValueError("Huffman output exceeds the available encoded bits")
     device = parts["stream"].device
     has_raw = "raw" in parts
+    if has_raw and (parts["raw"].dtype != torch.uint8 or parts["raw"].ndim != 1 or parts["raw"].numel() != n_symbols):
+        raise ValueError("raw must contain one uint8 low byte per symbol")
     nbytes = n_symbols * (2 if has_raw else 1)
     if out is not None and (out.dtype != torch.uint8 or out.device != device or
                             not out.is_contiguous() or out.numel() < nbytes):

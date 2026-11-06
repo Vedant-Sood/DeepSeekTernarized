@@ -121,6 +121,12 @@ outside this limit.
 `expert_cache_bytes` (`--expert-cache-mib` on `bench` and `serve`) bounds how many routed experts
 stay materialized. Hit rates are in the `bench` output and at the server's `/stats`.
 
+Checkpoint index paths and their resolved symlinks must stay inside the checkpoint directory.
+If a Hub cache snapshot links to files elsewhere, copy the files into a standalone directory first.
+QAT checkpoints use a restricted tensor/plain-data loader: the previous version 1 training
+checkpoints are not supported by that loader. See `docs/reports/security_review.md` for the trust
+boundaries and remaining limitations.
+
 ## Layout
 
 ```
