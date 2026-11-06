@@ -14,8 +14,9 @@
 // (one to a few tokens) is bandwidth bound on the packed weights, which every warp reads once
 // per token tile.
 //
-// Status: written for M3/M4, not yet compiled or run on a GPU (the development container has no
-// CUDA toolkit). tests/test_ternary_cuda.py checks it against the reference on any CUDA machine.
+// Status: compiled to sm_89 SASS without a GPU (clang 18 CUDA front end + ptxas 12.9, see
+// scripts/dev/cuda_compile_check.sh); never run. tests/test_ternary_cuda.py checks it against the
+// reference on any CUDA machine.
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -89,7 +90,10 @@ __global__ void ternary_grouped_kernel(float* __restrict__ out, const int8_t* __
     }
   }
   if (lane == 0) {
-    for (int r = 0; r < rows; ++r) out[(row0 + r) * N + n] += y[r] * x_scale[row0 + r];
+#pragma unroll
+    for (int r = 0; r < TOK_TILE; ++r) {  // unrolled with a guard so y[] stays in registers
+      if (r < rows) out[(row0 + r) * N + n] += y[r] * x_scale[row0 + r];
+    }
   }
 }
 
