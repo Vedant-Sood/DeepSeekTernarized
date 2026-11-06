@@ -156,18 +156,28 @@ def _cmd_bench(a) -> int:
     t0 = time.perf_counter()
     eng = Engine.load(a.checkpoint, max_seq_len=a.prompt_len + a.gen_len + 1, max_seqs=a.batch,
                       max_tokens=a.batch * (a.prompt_len + a.gen_len + 64), mode_b_cache_bytes=a.mode_b_cache_mib << 20,
-                      expert_cache_bytes=None if a.expert_cache_mib is None else a.expert_cache_mib << 20)
+                      expert_cache_bytes=None if a.expert_cache_mib is None else a.expert_cache_mib << 20,
+                      **({"device": a.device} if a.device else {}),
+                      **({"ternary_backend": a.ternary_backend} if a.ternary_backend else {}))
     t_load = time.perf_counter() - t0
     prompts = torch.randint(0, eng.cfg.vocab_size, (a.batch, a.prompt_len))
+    cuda = a.device is not None and a.device.startswith("cuda")
+    sync = torch.cuda.synchronize if cuda else (lambda: None)
     if isinstance(eng, StandardEngine):
+        if cuda:  # warm-up: CUDA context, kernel JIT, weight uploads already done at load
+            eng.model.forward(prompts[:, :8])
+            torch.cuda.reset_peak_memory_stats()
+        sync()
         t0 = time.perf_counter()
         logits, _, cache = eng.model.forward(prompts)
+        sync()
         t_pre = time.perf_counter() - t0
         nxt = logits[:, -1].argmax(-1)
         t0 = time.perf_counter()
         for _ in range(a.gen_len):
             logits, _, cache = eng.model.forward(nxt[:, None], cache)
             nxt = logits[:, -1].argmax(-1)
+        sync()
         t_dec = time.perf_counter() - t0
         pages, store, backend = None, eng.model.store, "torch_standard"
     else:
@@ -205,6 +215,11 @@ def _cmd_bench(a) -> int:
         "mode_b_cache_evictions": store.mode_b_cache_evictions,
         "expert_cache": eng.model.expert_cache.stats(),
     }
+    if isinstance(eng, StandardEngine):
+        res["device"], res["ternary_backend"] = a.device or "cpu", eng.model.ternary_backend
+    if cuda:
+        res["device_name"] = torch.cuda.get_device_name()
+        res["peak_vram_bytes"] = torch.cuda.max_memory_allocated()
     print(json.dumps(res, indent=2))
     return 0
 
@@ -363,6 +378,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--threads", type=int, default=4, help="PyTorch CPU math threads")
     s.add_argument("--mode-b-cache-mib", type=int, default=256, help="maximum decoded Mode B bytes retained in the LRU (MiB)")
     s.add_argument("--expert-cache-mib", type=int, help="bound on materialized routed experts (default: keep all)")
+    s.add_argument("--device", help="Llama/OLMoE: run on this device (e.g. cuda), weights resident")
+    s.add_argument("--ternary-backend", choices=("auto", "cpp", "torch", "cuda"),
+                   help="Llama/OLMoE ternary layers: C++/CUDA kernel (auto) or dequantized matmul (torch)")
     s.set_defaults(fn=_cmd_bench)
 
     s = sub.add_parser("serve", help="OpenAI-compatible HTTP server (/v1/completions, /v1/chat/completions, streaming)")
@@ -372,6 +390,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--name", help="model id reported by /v1/models (default: the directory name)")
     s.add_argument("--max-seq-len", type=int, default=4096)
     s.add_argument("--default-max-tokens", type=int, default=256)
+    s.add_argument("--device", help="Llama/OLMoE: serve from this device (e.g. cuda)")
     s.add_argument("--threads", type=int, default=4, help="PyTorch CPU math threads")
     s.add_argument("--mode-b-cache-mib", type=int, default=256, help="maximum decoded Mode B bytes retained in the LRU (MiB)")
     s.add_argument("--expert-cache-mib", type=int, help="bound on materialized routed experts (default: keep all)")
@@ -387,6 +406,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--threads", type=int, default=4, help="PyTorch CPU math threads")
     s.add_argument("--mode-b-cache-mib", type=int, default=256)
     s.add_argument("--out", help="write the results JSON here")
+    s.add_argument("--device", help="Llama/OLMoE: evaluate on this device (e.g. cuda)")
     s.set_defaults(fn=lambda a: __import__("boilerplate.evals.lm_eval_adapter", fromlist=["main"]).main(a))
 
     s = sub.add_parser("qat-estimate", help="FLOPs, GPU memory, hours and cost for a QAT run config (no training)")
