@@ -1,0 +1,14 @@
+# M4 PTQ arm for standard decoders (SmolLM2, OLMoE): absmean (BitNet b1.58) ternary, TQ2 packing (same trits as TQ1)
+# Block projections ternary; embeddings, LM head, norms and router stay in the source format.
+name: std_absmean_tq2
+default: {mode: A}
+rules:
+  - match: '^model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj|mlp\.experts\.\d+\.(gate|up|down)_proj)$'
+    mode: C
+    k: 1
+    group: 128
+    packing: tq2
+    scale_dtype: fp16
+    act: int8
+    gptq: false
+    fit: absmean

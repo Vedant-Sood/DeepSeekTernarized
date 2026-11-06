@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 import torch
 
@@ -154,7 +155,8 @@ def _cmd_bench(a) -> int:
     torch.manual_seed(a.seed)
     t0 = time.perf_counter()
     eng = Engine.load(a.checkpoint, max_seq_len=a.prompt_len + a.gen_len + 1, max_seqs=a.batch,
-                      max_tokens=a.batch * (a.prompt_len + a.gen_len + 64), mode_b_cache_bytes=a.mode_b_cache_mib << 20)
+                      max_tokens=a.batch * (a.prompt_len + a.gen_len + 64), mode_b_cache_bytes=a.mode_b_cache_mib << 20,
+                      expert_cache_bytes=None if a.expert_cache_mib is None else a.expert_cache_mib << 20)
     t_load = time.perf_counter() - t0
     prompts = torch.randint(0, eng.cfg.vocab_size, (a.batch, a.prompt_len))
     if isinstance(eng, StandardEngine):
@@ -201,6 +203,7 @@ def _cmd_bench(a) -> int:
         "mode_b_cache_hits": store.mode_b_cache_hits,
         "mode_b_cache_misses": store.mode_b_cache_misses,
         "mode_b_cache_evictions": store.mode_b_cache_evictions,
+        "expert_cache": eng.model.expert_cache.stats(),
     }
     print(json.dumps(res, indent=2))
     return 0
@@ -234,11 +237,59 @@ def _cmd_export(a) -> int:
         if not seqs:
             raise SystemExit(f"calibration text is shorter than --calib-len {a.calib_len} tokens")
         layers = {int(x) for x in a.calib_layers.split(",")} if a.calib_layers else None
-        hessians = calibrate(eng, seqs, pol, layers)
+        hessians = calibrate(eng, seqs, pol, layers, min_tokens=a.calib_min_tokens)
     out = export(a.source, a.out_dir, pol, hessians=hessians, shard_bytes=int(a.shard_gb * 2**30))
     s = json.loads((out / "manifest.json").read_text())["summary"]
     print(json.dumps(s, indent=2))
     return 0
+
+
+def _cmd_gguf(a) -> int:
+    from .format.gguf_export import merge_into_base, write_ternary_only
+
+    if a.base:
+        info = merge_into_base(a.base, a.export_dir, a.out, a.packing)
+    else:
+        info = write_ternary_only(a.export_dir, a.out, a.packing)
+    print(json.dumps({"out": str(a.out), "bytes": Path(a.out).stat().st_size, "qtype": info["qtype"],
+                      "converted": len(info["converted"]), "skipped": info["skipped"]}, indent=2))
+    return 0
+
+
+def _cmd_cast(a) -> int:
+    from .checkpoint.cast import cast_checkpoint
+
+    cast_checkpoint(a.source, a.out, a.dtype)
+    return 0
+
+
+def _cmd_qat_tokenize(a) -> int:
+    from .qat.data import tokenize_text_file
+
+    out = tokenize_text_file(a.text, a.tokenizer, a.out)
+    print(out.with_suffix(".json").read_text())
+    return 0
+
+
+def _cmd_qat_teacher(a) -> int:
+    from transformers import AutoModelForCausalLM
+
+    from .qat.data import TokenWindows
+    from .qat.teacher import precompute
+
+    dev = a.device if a.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+    model = AutoModelForCausalLM.from_pretrained(a.teacher, dtype=torch.bfloat16 if dev == "cuda" else torch.float32)
+    windows = TokenWindows(a.tokens, a.seq_len)
+    n = min(len(windows), a.windows) if a.windows else len(windows)
+    precompute(model, windows, a.out, list(range(n)), k=a.k, temperature=a.temperature, batch=a.batch, device=dev)
+    return 0
+
+
+def _cmd_qat_train(a) -> int:
+    from .qat.train import main as train_main
+
+    return train_main([str(a.config)] + (["--max-steps", str(a.max_steps)] if a.max_steps is not None else [])
+                      + (["--plan"] if a.plan else []))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -311,7 +362,42 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--seed", type=int, default=0)
     s.add_argument("--threads", type=int, default=4, help="PyTorch CPU math threads")
     s.add_argument("--mode-b-cache-mib", type=int, default=256, help="maximum decoded Mode B bytes retained in the LRU (MiB)")
+    s.add_argument("--expert-cache-mib", type=int, help="bound on materialized routed experts (default: keep all)")
     s.set_defaults(fn=_cmd_bench)
+
+    s = sub.add_parser("serve", help="OpenAI-compatible HTTP server (/v1/completions, /v1/chat/completions, streaming)")
+    s.add_argument("checkpoint")
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8000)
+    s.add_argument("--name", help="model id reported by /v1/models (default: the directory name)")
+    s.add_argument("--max-seq-len", type=int, default=4096)
+    s.add_argument("--default-max-tokens", type=int, default=256)
+    s.add_argument("--threads", type=int, default=4, help="PyTorch CPU math threads")
+    s.add_argument("--mode-b-cache-mib", type=int, default=256, help="maximum decoded Mode B bytes retained in the LRU (MiB)")
+    s.add_argument("--expert-cache-mib", type=int, help="bound on materialized routed experts (default: keep all)")
+    s.set_defaults(fn=lambda a: __import__("boilerplate.serve", fromlist=["main"]).main(a))
+
+    s = sub.add_parser("lm-eval", help="run lm-evaluation-harness tasks in process on a checkpoint (needs lm_eval)")
+    s.add_argument("checkpoint")
+    s.add_argument("--tasks", required=True, help="comma-separated harness task names")
+    s.add_argument("--limit", type=float, help="examples per task (or a fraction)")
+    s.add_argument("--num-fewshot", type=int)
+    s.add_argument("--seed", type=int, default=1234)
+    s.add_argument("--max-seq-len", type=int, default=4096)
+    s.add_argument("--threads", type=int, default=4, help="PyTorch CPU math threads")
+    s.add_argument("--mode-b-cache-mib", type=int, default=256)
+    s.add_argument("--out", help="write the results JSON here")
+    s.set_defaults(fn=lambda a: __import__("boilerplate.evals.lm_eval_adapter", fromlist=["main"]).main(a))
+
+    s = sub.add_parser("qat-estimate", help="FLOPs, GPU memory, hours and cost for a QAT run config (no training)")
+    s.add_argument("config")
+    s.add_argument("--gpu", default="h100", help="h100, a100, l40s, rtx4090, rtx4060-laptop")
+    s.add_argument("--gpus", type=int, default=1, help="data-parallel (FSDP) world size")
+    s.add_argument("--mfu", type=float, default=0.35, help="assumed model FLOP utilization when --tok-s is not given")
+    s.add_argument("--tok-s", type=float, help="measured training throughput (all GPUs) from a probe run's log")
+    s.add_argument("--price", type=float, help="USD per GPU-hour, for a cost line")
+    s.add_argument("--token-budget", type=float, help="override the config's token budget (e.g. 3e9)")
+    s.set_defaults(fn=lambda a: __import__("boilerplate.qat.estimate", fromlist=["main"]).main(a))
 
     s = sub.add_parser("compare", help="compare two traces layer by layer")
     s.add_argument("reference")
@@ -328,7 +414,46 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--calib-seqs", type=int, default=512, help="GPTQ: number of calibration sequences")
     s.add_argument("--calib-len", type=int, default=512, help="GPTQ: tokens per calibration sequence")
     s.add_argument("--calib-layers", help="GPTQ: only calibrate these layer ids (comma-separated)")
+    s.add_argument("--calib-min-tokens", type=int, default=1,
+                   help="GPTQ: weights that saw fewer calibration tokens use the plain fit (recorded in the manifest)")
     s.set_defaults(fn=_cmd_export)
+
+    s = sub.add_parser("gguf", help="write single-term ternary weights (k=1, group 256, fp16) as llama.cpp TQ1_0/TQ2_0")
+    s.add_argument("export_dir", help="a Boilerplate export of a llama/olmoe checkpoint")
+    s.add_argument("out", help="output .gguf")
+    s.add_argument("--base", help="llama.cpp BF16/F32 conversion of the same source; its other tensors and metadata are kept")
+    s.add_argument("--packing", choices=("tq1", "tq2"), default="tq1")
+    s.set_defaults(fn=_cmd_gguf)
+
+    s = sub.add_parser("cast", help="cast a safetensors checkpoint to another float dtype (e.g. OLMoE F32 -> BF16)")
+    s.add_argument("source")
+    s.add_argument("out")
+    s.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
+    s.set_defaults(fn=_cmd_cast)
+
+    s = sub.add_parser("qat-tokenize", help="tokenize a text file into a QAT token file (.bin + .json)")
+    s.add_argument("text")
+    s.add_argument("tokenizer", help="tokenizer.json")
+    s.add_argument("out", help="output .bin")
+    s.set_defaults(fn=_cmd_qat_tokenize)
+
+    s = sub.add_parser("qat-teacher", help="precompute teacher top-k log-probs per training window (offline distillation)")
+    s.add_argument("teacher", help="HF checkpoint of the unquantized teacher")
+    s.add_argument("tokens", help="token file from qat-tokenize")
+    s.add_argument("out")
+    s.add_argument("--seq-len", type=int, default=2048)
+    s.add_argument("--k", type=int, default=32)
+    s.add_argument("--temperature", type=float, default=1.0)
+    s.add_argument("--batch", type=int, default=1)
+    s.add_argument("--windows", type=int, help="only the first N windows")
+    s.add_argument("--device", default="auto")
+    s.set_defaults(fn=_cmd_qat_teacher)
+
+    s = sub.add_parser("qat-train", help="ternary QAT from a YAML run config (runs over 20 steps need approval: in the config)")
+    s.add_argument("config")
+    s.add_argument("--max-steps", type=int)
+    s.add_argument("--plan", action="store_true", help="print steps/tokens and exit")
+    s.set_defaults(fn=_cmd_qat_train)
 
     a = p.parse_args(argv)
     return a.fn(a)

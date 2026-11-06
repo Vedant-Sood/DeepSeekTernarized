@@ -54,7 +54,8 @@ class Engine:
 
     @classmethod
     def load(cls, path: str | Path, max_seq_len: int = 4096, tokenizer_path: str | Path | None = None,
-             mode_b_cache_bytes: int = 256 << 20, dequant_cache_bytes: int = 2 << 30, **cache_args) -> "Engine":
+             mode_b_cache_bytes: int = 256 << 20, dequant_cache_bytes: int = 2 << 30,
+             expert_cache_bytes: int | None = None, **cache_args) -> "Engine":
         path = Path(path)
         config = json.loads((path / "config.json").read_text())
         if config.get("model_type") in ("llama", "olmoe"):
@@ -67,11 +68,13 @@ class Engine:
             if cache_args.pop("page_size", 64) != 64:
                 raise ValueError("standard decoder does not implement paged KV")
             return StandardEngine.load(path, max_seq_len=max_seq_len, tokenizer_path=tokenizer_path,
-                                       mode_b_cache_bytes=mode_b_cache_bytes, **cache_args)
+                                       mode_b_cache_bytes=mode_b_cache_bytes, expert_cache_bytes=expert_cache_bytes,
+                                       **cache_args)
         cfg = EngineConfig.from_hf(config)
         tok = load_tokenizer(tokenizer_path or path)
         model = V4Model(cfg, WeightStore(path, mode_b_cache_bytes=mode_b_cache_bytes), tokenizer=tok,
-                        max_seq_len=max_seq_len, dequant_cache_bytes=dequant_cache_bytes)
+                        max_seq_len=max_seq_len, dequant_cache_bytes=dequant_cache_bytes,
+                        expert_cache_bytes=expert_cache_bytes)
         return cls(model, tok, **cache_args)
 
     def new_cache(self) -> KVCache:

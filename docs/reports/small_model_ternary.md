@@ -16,7 +16,9 @@ throughput probe has been run.
 | Standard-decoder checks | `tests/test_standard_engine.py` | Tiny random Llama/OLMoE comparisons against Hugging Face, including greedy tokens, Mode B byte parity and a mixed B/C export. |
 | llama.cpp baseline | External checkout `ggml-org/llama.cpp` at `149f5641b931aaf33697d70f9abc90c3e5300247` | Pinned source; CPU quantize, importance-matrix, perplexity and benchmark tools built. |
 
-These primitives are not yet a training pipeline or a complete Mode D model exporter. The
+*Superseded on 2026-11-05: the training pipeline, Mode D export, teacher data, routing
+diagnostics, distributed checkpointing and GGUF export now exist; see "Follow-up, 2026-11-05"
+at the end. The original paragraph follows.* These primitives are not yet a training pipeline or a complete Mode D model exporter. The
 standard path is not yet validated on the pretrained OLMoE checkpoint. It uses a simple tensor
 KV cache and does not yet have a GPU path or paged KV. Offline teacher-data generation, routing
 diagnostics, distributed checkpoint/resume, distributed training and GGUF export are not yet
@@ -149,6 +151,82 @@ second half of each complete context window.
 | Normalization | 62,400 | 124,800 | 16.0000 | 16.0000 |
 | **Whole checkpoint, including non-tensor files** | **361,821,120** | **725,784,757** | **16.0474** | **16.0474** |
 
+## Follow-up, 2026-11-04: SmolLM2 post-training ternary arms
+
+Built in this change (see the table in PR #22): `fit: absmean` policies (the BitNet b1.58 quantizer
+that QAT trains against), GPTQ calibration through the standard decoder, routing-drift metrics,
+FSDP2 sharding with a 2-process `gloo` QAT dry run (exact resume), and `boilerplate gguf` for
+llama.cpp `TQ1_0`/`TQ2_0`.
+
+**Setup.** Source `HuggingFaceTB/SmolLM2-360M` at the pinned revision above. Every projection in
+the 32 blocks (q/k/v/o, gate/up/down: 314,572,800 weights) is ternary. The tied embedding/LM head
+(BF16) and norms stay in the source format, as the plan says. Group 128, FP16 scales, int8
+per-token activations. GPTQ Hessians: 128 non-overlapping 512-token windows of the pinned
+WikiText-2 train text (SHA-256 `aee724fa…`). They were collected on the unquantized model in
+one pass (not the sequential quantized-input variant). Calibration took 300.9 s and no weight
+fell back to the plain fit.
+
+**Perplexity protocol.** Pinned WikiText-2 raw test rows joined with blank lines (SHA-256
+`696cca6b…`, 304,978 tokens, no BOS), non-overlapping 2,048-token windows, second half of each
+window scored, as llama.cpp `llama-perplexity` does. **Only the first 40 of the 148 windows
+(40,920 scored tokens) were evaluated.** A container restart killed the first full-length runs
+at 40/148 windows of the source. The reruns were cut to 40 windows to fit in the session, so
+these are subset perplexities, not the plan's full-test number. Hardware: Intel Xeon @ 2.10 GHz
+cloud CPU, 4 cores, 4 pinned threads, PyTorch 2.15 CPU, FP32 compute. Ternary layers use the
+`torch` backend: int8-quantized activations times the cached dequantized trits. It computes the
+same values as the C++ kernel, up to FP32 summation order.
+
+| Arm | Fit | Ternary b/w (scales incl.) | Whole model b/w | Export dir bytes (stat) | WikiText-2 ppl, 40 windows |
+|---|---|---:|---:|---:|---:|
+| Source (BF16, FP32 compute) | — | — | 16.0474 | 725,784,757 † | **9.577** |
+| Absmean TQ1 k=1 | absmean | 1.7313 | 3.5945 | 165,003,247 | 584,405 |
+| Absmean TQ2 k=1 | absmean | 2.1313 | 3.9423 | 180,731,888 | same trits as TQ1 ‡ |
+| TQ1 k=1 | least squares | 1.7313 | 3.5945 | 165,002,342 | 937,533 |
+| TQ1 k=1 + GPTQ | GPTQ | 1.7313 | 3.5945 | 165,002,122 | 18,364 |
+| Mode C TQ1 k=2 | least squares | 3.4625 | 5.0997 | 233,280,070 | 108,276 |
+| Mode C TQ1 k=2 + GPTQ | GPTQ | 3.4625 | 5.0997 | 233,279,850 | **21.083** |
+
+† The six checkpoint/tokenizer files measured earlier in this report. Export directories also
+contain `manifest.json` and the index. "Whole model b/w" uses the manifest's payload bytes over
+all 361,821,120 parameters, with the BF16 embedding included.
+‡ TQ2 stores exactly the same trits and scales as TQ1, so its outputs are identical; only the
+packing (size) differs. Not re-run.
+
+What this says:
+
+* **Plain ternary PTQ of every linear destroys a 360M model.** Absmean (the QAT quantizer
+  without training), the least-squares single term and plain two-term Mode C all give
+  perplexities of 10^5 to 10^6. For reference, a uniform distribution over the 49,152-token
+  vocabulary has perplexity 49,152. On the first two windows, the C++ kernel backend gave the
+  same order of magnitude for absmean (2.9 M vs 3.2 M with the torch backend). Both are
+  collapsed, and the difference is not meaningful there. A diagnostic run on 512 tokens showed
+  the hidden-state cosine against the source falling from 0.95 (mean, layer 0) to 0.34 (layer
+  31) for plain k = 2. Per-matrix relative weight error was 0.22 (down_proj) and 0.30 (q_proj).
+* **GPTQ is what makes k = 2 usable**: 21.1 against 9.58 for the source, 2.2× the source
+  perplexity. That is the same direction as M2's finding on DeepSeek experts (plain k = 2 not
+  close enough, GPTQ needed), here at full-model scale. GPTQ does not rescue a single term
+  (18,364).
+* Size context: the k = 2 + GPTQ arm (233.3 MB on disk) is **larger** than llama.cpp `Q2_K`
+  (218.7 MB) and `IQ2_XS` (208.0 MB) from the table above. One reason is that the plan keeps
+  the tied embedding in BF16 (94.5 MB, 41% of the file), while llama.cpp stores it at 8.5 b/w.
+  Quality comparison with those files needs llama.cpp perplexity on the same 40 windows. That
+  is **not run**: building and running llama.cpp was not permitted in this environment, so it
+  has to run on another machine.
+* The verdict criterion is about QAT, not PTQ, and remains **untested**. These arms show what
+  training has to recover: a single ternary term without training is unusable at this scale.
+
+GGUF: with the `std_absmean_tq1_g256` policy (group 256 = llama.cpp block),
+`boilerplate gguf` converted the 32 `down_proj` tensors (input dim 2,560) to `TQ1_0` exactly.
+The other 192 projections have input dim 960, which is not a multiple of 256, so llama.cpp's
+TQ types cannot hold them. A llama.cpp ternary comparison on identical weights is therefore only
+meaningful on OLMoE (2,048 / 1,024).
+
+Not run in this follow-up, with reasons: the remaining 108 windows (session time); CPU RSS and
+speed for the PTQ arms (the timings above share the CPU with other jobs and include FP32
+dequantization); held-out pretraining-mix perplexity and lm-eval tasks (not yet wired up); all
+OLMoE arms (the F32 → BF16 source question is waiting on Vedant; the F32 checkpoint is about
+28 GB, which also exceeds this container's 15 GB RAM).
+
 ## Experiment status
 
 All quality, memory and throughput measurements below are **not run** or in progress. SmolLM2
@@ -160,8 +238,8 @@ No model-file size or speed is inferred from the synthetic tests.
 |---|---|
 | Original source and BF16 comparison | SmolLM2 source size measured above; complete evaluations and OLMoE source conversion not yet performed |
 | llama.cpp Q8_0, Q4_K_M, Q3_K_M, Q2_K, IQ2_XS | SmolLM2 files measured above; OLMoE files and quality/speed evaluations not run |
-| Absmean TQ1 / TQ2, plain / GPTQ | not run: full-model PTQ exports and evaluation not yet performed |
-| Mode C TQ1 k=2, plain / GPTQ | not run: full-model PTQ exports and evaluation not yet performed |
+| Absmean TQ1 / TQ2, plain / GPTQ | SmolLM2: exported, sizes and 40-window WikiText-2 ppl in the follow-up above (absmean has no GPTQ variant; GPTQ is reported for the least-squares single term); OLMoE not run |
+| Mode C TQ1 k=2, plain / GPTQ | SmolLM2: exported, sizes and 40-window WikiText-2 ppl above; OLMoE not run |
 | SmolLM2 QAT shakedown | not run: GPU budget and throughput probe require owner approval |
 | OLMoE QAT at 1 B / 3 B / 10 B tokens, TQ1 / TQ2 | not run: multi-GPU hardware and training budget require owner approval |
 
@@ -174,3 +252,53 @@ overlap and expert-load entropy are **not run** for the reasons above.
 The pre-registered verdict is **untested**: there is no OLMoE QAT run or evaluated conventional
 baseline to compare. In particular, the primitive tests do not establish model quality, file
 size or speed.
+
+## Follow-up, 2026-11-05: code complete for the gated runs
+
+Everything the plan needs before a GPU is approved is now in the repository and tested on tiny
+random models on CPU. **Nothing in this section is a measurement of a pretrained model**: no QAT
+run, throughput probe or GPU kernel run has happened.
+
+| Piece | Where | Tested by |
+|---|---|---|
+| Training loop from one YAML config: FSDP2 when `WORLD_SIZE > 1`, AdamW (or 8-bit AdamW), LR warmup + cosine, lambda warmup, CE or CE + KL to stored teacher top-k, gradient clipping, JSON-lines logs, routing drift on a fixed probe batch, checkpoints, exact resume, Mode D export at the end and at `export_at_tokens` | `boilerplate/qat/train.py`, `boilerplate qat-train` | `tests/test_qat_train.py` (export parity with the engine, exact resume, OLMoE with offline teacher, snapshots) |
+| Approval gate: runs over 20 optimizer steps refuse to start without `approval:` in the config | `train.py` | `test_approval_gate` |
+| Token files, sampler with resumable state and rank split; offline teacher top-k shards | `qat/data.py`, `qat/teacher.py`, `qat-tokenize`, `qat-teacher` | `tests/test_qat_train.py` |
+| OLMoE F32 → BF16 cast with SHA-256 per shard (decision: cast first, both paths supported) | `checkpoint/cast.py`, `boilerplate cast` | `test_cast_checkpoint_f32_to_bf16` |
+| Mode D export (one absmean ternary term per BitLinear) and GGUF `TQ1_0`/`TQ2_0` | `qat/export.py`, `format/gguf_export.py` | `tests/test_qat_train.py`, `tests/test_gguf_export.py` |
+| CUDA ternary GEMM/GEMV and grouped expert GEMM (TQ1/TQ2, int8 activations, one launch for all experts) | `kernels/csrc/ternary_cuda_kernel.cu`, `kernels/ternary_cuda.py` | `tests/test_ternary_cuda.py`: reference vs dense and vs the C++ CPU kernel run here; **the CUDA parity tests skip: the kernel has not been compiled or run** (no GPU or toolkit in this container) |
+| Compute / memory / cost estimator | `qat/estimate.py`, `boilerplate qat-estimate` | `test_qat_estimate` |
+| lm-eval-harness adapter (loglikelihood, rolling, generate_until) | `evals/lm_eval_adapter.py`, `boilerplate lm-eval` | `tests/test_lm_eval_adapter.py` (scores match transformers) |
+| Launch scripts | `scripts/launch/smollm2_shakedown.sh`, `scripts/launch/olmoe_qat.sh`, `configs/qat/*.yaml` | `bash -n`; gates checked by hand |
+
+Still not built: expert parallelism (FSDP2 shards experts like any other weight, which is enough
+for OLMoE at 4 × 80 GB but not for V4.1), a fused grouped-expert path in the training graph
+(`qat/model.py::Experts` loops over experts in Python, which keeps MFU low on MoE), a NEON build of
+the CPU kernel (not testable here: no ARM runner or qemu), and BF16 activations in the CUDA kernel
+(int8 only; BF16 falls back to the dequantized matmul).
+
+### Compute estimates (planning numbers, not measurements)
+
+From `boilerplate qat-estimate` with the committed configs: training FLOPs = 6 × active
+parameters × tokens; the offline teacher pass adds 2 × active × tokens once. SmolLM2-360M has
+361.8 M parameters (counted from its safetensors headers). OLMoE-1B-7B-0125: 6.92 B total,
+1.28 B active (computed from its `config.json`: 16 layers, hidden 2048, 64 experts of
+intermediate 1024, top-8, untied 50,304-token embeddings; the model card says 6.9 B / 1.3 B).
+MFU is an assumption until a 20-step probe gives a measured tok/s; MoE training with the
+per-expert loop is expected at the low end.
+
+| Run | Tokens | Train FLOPs | Teacher FLOPs | Memory / GPU (est.) | Hardware | Wall clock at MFU 10% / 20% / 40% | GPU-hours at the same |
+|---|---|---|---|---|---|---|---|
+| SmolLM2 shakedown | 0.5 B | 1.1e18 | 3.6e17 | 2.5 GiB (8-bit AdamW, checkpointing) | 1 × RTX 4060 laptop (~60 TFLOP/s BF16 assumed) | 50 h / 25 h / 13 h | same |
+| OLMoE QAT | 1 B | 7.7e18 | 2.6e18 | 19.8 GiB (FSDP over 4) | 4 × H100 80 GB | 5.4 h / 2.7 h / 1.4 h | 22 / 11 / 5 |
+| OLMoE QAT | 3 B | 2.3e19 | 7.7e18 | 19.8 GiB | 4 × H100 | 16 h / 8.1 h / 4.1 h | 65 / 32 / 16 |
+| OLMoE QAT (snapshots at 1 B, 3 B) | 10 B | 7.7e19 | 2.6e19 | 19.8 GiB | 4 × H100 | 54 h / 27 h / 13.5 h | 216 / 108 / 54 |
+
+The 10 B estimate at MFU 10–20 % (108–216 H100-hours) agrees with the plan's 100–200. Multiply
+GPU-hours by the provider's hourly price for cost (`--price`). The OLMoE memory figure leaves room
+for a larger micro batch; the plan's 2–4 GPUs are both feasible.
+
+Next, all gated on Vedant: approve the SmolLM2 probe and shakedown budget (then
+`scripts/launch/smollm2_shakedown.sh prepare|probe|train|eval`), and the OLMoE budget
+(`scripts/launch/olmoe_qat.sh`). The OLMoE baselines and PTQ arms need a machine with more than
+this container's 15 GB RAM; llama.cpp runs need a machine where building it is allowed.

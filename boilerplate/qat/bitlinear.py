@@ -13,29 +13,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from ..ternary.fit import TernaryTerm
+from ..ternary.fit import absmean_ternary
 from ..ternary.ops import PackedTerm, quant_act_int8
 from ..ternary.pack import pack
-
-
-@torch.no_grad()
-def absmean_ternary(weight: torch.Tensor, group: int, scale_dtype: torch.dtype = torch.float16) -> TernaryTerm:
-    """Quantize a matrix to signed trits and one absmean scale per row and group."""
-    if weight.ndim != 2 or group <= 0 or weight.size(1) == 0:
-        raise ValueError("weight must be a matrix with a nonempty input dimension and positive group")
-    if scale_dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("scale_dtype must be float16 or bfloat16")
-    rows, columns = weight.shape
-    groups = math.ceil(columns / group)
-    data = F.pad(weight.float(), (0, groups * group - columns)).view(rows, groups, group)
-    counts = torch.full((groups,), group, dtype=torch.float32, device=weight.device)
-    counts[-1] = columns - (groups - 1) * group
-    # Round the scale to the stored format before quantizing, so training uses precisely the
-    # same scale that the engine will read after export.
-    scale = (data.abs().sum(-1) / counts).to(scale_dtype)
-    scale_f32 = scale.float().unsqueeze(-1)
-    trits = torch.where(scale_f32 > 0, torch.round(data / scale_f32.clamp_min(1e-30)).clamp(-1, 1), 0)
-    return TernaryTerm(trits.to(torch.int8).view(rows, -1)[:, :columns].contiguous(), scale)
 
 
 def warmup_level(step: int, warmup_steps: int) -> float:

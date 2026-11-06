@@ -1,0 +1,19 @@
+# M5 variant C-quality: routed experts TQ1 k=2 + GPTQ (512 calibration sequences, plain fit below
+# --calib-min-tokens), engram tables ternarized (TQ1 k=2), everything else as released.
+name: m5-c_quality_engram
+default: {mode: A}
+rules:
+  - match: '^layers\.\d+\.ffn\.experts\.\d+\.w[123]$'
+    mode: C
+    k: 2
+    group: 128
+    packing: tq1
+    scale_dtype: fp16
+    act: int8
+    gptq: true
+  - match: '^layers\.\d+\.engram\.embed$'   # lookup table: no GPTQ (no matmul to compensate)
+    mode: C
+    k: 2
+    group: 128
+    packing: tq1
+    scale_dtype: fp16

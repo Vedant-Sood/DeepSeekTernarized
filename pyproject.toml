@@ -19,6 +19,12 @@ dependencies = [
 
 [project.optional-dependencies]
 hf = ["transformers>=4.50", "huggingface_hub>=0.25"]
+# `boilerplate gguf`: ternary weights as llama.cpp TQ1_0/TQ2_0
+gguf = ["gguf>=0.17"]
+# `boilerplate serve`: OpenAI-compatible HTTP server
+serve = ["starlette>=0.40", "uvicorn>=0.30", "jinja2>=3"]
+# `boilerplate lm-eval`: EleutherAI lm-evaluation-harness adapter
+eval = ["lm_eval>=0.4"]
 dev = ["pytest>=8"]
 # JIT build of the C++ CPU kernels (boilerplate/kernels/csrc); without it the PyTorch fallbacks run
 cpp = ["ninja"]

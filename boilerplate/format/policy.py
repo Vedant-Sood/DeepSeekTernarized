@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-MODES = ("A", "B", "C")
+MODES = ("A", "B", "C", "D")  # D: QAT-trained single ternary term (exported with the absmean quantizer)
 MAX_RATIO = 0.85
 
 
@@ -27,6 +27,7 @@ class Rule:
     scale_dtype: str = "fp16"
     act: str = "int8"
     gptq: bool = False
+    fit: str = "lsq"  # "lsq": least-squares greedy residual fit; "absmean": BitNet b1.58 quantizer (k = 1)
     allow_larger: bool = False  # permit Mode C settings that do not shrink the source (experiments)
 
     def effective_bits(self) -> float:
@@ -37,7 +38,10 @@ class Rule:
         self.regex = re.compile(self.match)
         if self.mode not in MODES:
             raise ValueError(f"mode {self.mode!r}: expected one of {MODES}")
-        if self.mode == "C":
+        if self.mode == "D":
+            # Mode D stores what QAT trained against: one absmean term, no GPTQ.
+            self.k, self.fit, self.gptq = 1, "absmean", False
+        if self.mode in ("C", "D"):
             if not 1 <= self.k <= 4:
                 raise ValueError("k must be 1..4")
             if self.packing not in ("tq2", "tq1"):
@@ -46,6 +50,10 @@ class Rule:
                 raise ValueError(f"scale_dtype {self.scale_dtype!r}")
             if self.act not in ("int8", "bf16"):
                 raise ValueError(f"act {self.act!r}")
+            if self.fit not in ("lsq", "absmean"):
+                raise ValueError(f"fit {self.fit!r}: expected lsq or absmean")
+            if self.fit == "absmean" and (self.k != 1 or self.gptq):
+                raise ValueError("fit: absmean is the single-term BitNet quantizer; it needs k = 1 and no gptq")
 
 
 @dataclass
@@ -70,7 +78,7 @@ class Policy:
         return cls.from_dict(yaml.safe_load(Path(path).read_text()))
 
     def to_dict(self) -> dict:
-        keep = ("match", "mode", "k", "group", "packing", "scale_dtype", "act", "gptq", "allow_larger")
+        keep = ("match", "mode", "k", "group", "packing", "scale_dtype", "act", "gptq", "fit", "allow_larger")
         return {
             "name": self.name,
             "default": {k: getattr(self.default, k) for k in keep if k != "match"},
