@@ -150,3 +150,24 @@ def test_qat_estimate(tmp_path):
     measured = estimate(cfg, world=2, tok_s=100.0, price_per_gpu_hour=2.0)
     assert measured["wall_clock_hours"] == pytest.approx(e["tokens"] / 100 / 3600)
     assert measured["cost"] == pytest.approx(measured["gpu_hours"] * 2.0)
+
+
+def test_mode_d_export_keeps_source_dtype_for_mode_a_tensors(tmp_path):
+    from safetensors import safe_open
+
+    from boilerplate.checkpoint.cast import cast_checkpoint
+    from boilerplate.qat.export import export_mode_d
+    from boilerplate.qat.model import load_for_qat
+
+    src = tmp_path / "f32"
+    _source(src, "llama")
+    bf16 = cast_checkpoint(src, tmp_path / "bf16", "bf16", log=lambda *_: None)
+    model, _ = load_for_qat(str(bf16), dtype=torch.float32, group=16)  # FP32 master copy
+    out = export_mode_d(model, bf16, tmp_path / "mode_d", log=lambda *_: None)
+    manifest = json.loads((out / "manifest.json").read_text())
+    shard = next(out.glob("*.safetensors"))
+    with safe_open(str(shard), "pt") as h:
+        dtypes = {k: h.get_slice(k).get_dtype() for k in h.keys()}
+    embed = [k for k in dtypes if "embed_tokens" in k]
+    assert embed and all(dtypes[k] == "BF16" for k in embed)
+    assert manifest["tensors"]["model.layers.0.mlp.down_proj"]["mode"] == "D"

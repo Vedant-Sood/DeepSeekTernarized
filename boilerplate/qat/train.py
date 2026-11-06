@@ -131,12 +131,21 @@ def train(cfg: RunConfig, log=print) -> dict:
     params = [q for q in model.parameters() if q.requires_grad]
     optimizer = _optimizer(params, cfg)
     windows = TokenWindows(cfg.train_tokens, cfg.seq_len)
-    sampler = Sampler(len(windows), seed=cfg.seed, rank=rank, world=world)
-    teacher = None
+    teacher, pool = None, None
     if cfg.teacher_dir:
         from .teacher import TeacherStore
 
         teacher = TeacherStore(cfg.teacher_dir)
+        tm = teacher.meta
+        if tm["seq_len"] != cfg.seq_len or tm.get("token_file_sha256") != windows.meta.get("sha256"):
+            raise SystemExit(f"teacher {cfg.teacher_dir} was built for seq_len {tm['seq_len']} on token file "
+                             f"{tm.get('token_file_sha256')}; this run uses seq_len {cfg.seq_len} on "
+                             f"{windows.meta.get('sha256')}")
+        if len(teacher.where) < len(windows):  # train only on windows that have teacher outputs
+            pool = sorted(teacher.where)
+            if rank == 0:
+                log(json.dumps({"event": "teacher_subset", "windows": len(pool), "of": len(windows)}))
+    sampler = Sampler(len(pool) if pool else len(windows), seed=cfg.seed, rank=rank, world=world)
     moe = info["model_type"] == "olmoe"
     probe_ids = list(range(cfg.probe_windows))
     probe = batch(windows, probe_ids)[0].to(device)
@@ -201,6 +210,8 @@ def train(cfg: RunConfig, log=print) -> dict:
         total_loss = 0.0
         for _ in range(cfg.grad_accum):
             ids = sampler.next(cfg.micro_batch)
+            if pool:
+                ids = [pool[i] for i in ids]
             x, y = batch(windows, ids)
             x, y = x.to(device), y.to(device)
             logits = model(x).logits

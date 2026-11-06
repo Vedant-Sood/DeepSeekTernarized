@@ -33,6 +33,18 @@ def bitlinear_settings(model: nn.Module) -> tuple[list[str], int, str]:
     return [n for n, _ in mods], groups.pop(), scale
 
 
+def _source_dtypes(source_dir: Path) -> dict[str, torch.dtype]:
+    from safetensors import safe_open
+
+    out = {}
+    for f in sorted(source_dir.glob("*.safetensors")):
+        with safe_open(str(f), "pt") as h:
+            for k in h.keys():
+                out[k] = h.get_slice(k).get_dtype()
+    names = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32}
+    return {k: names[v] for k, v in out.items() if v in names}
+
+
 def export_mode_d(model: nn.Module, source_dir: str | Path, out_dir: str | Path, *, packing: str = "tq1",
                   state_dict: dict[str, torch.Tensor] | None = None, log=print) -> Path:
     """Write ``model`` (or a gathered full ``state_dict`` of it) as a Mode D export.
@@ -46,6 +58,15 @@ def export_mode_d(model: nn.Module, source_dir: str | Path, out_dir: str | Path,
     if getattr(model.config, "tie_word_embeddings", False):
         tensors.pop("lm_head.weight", None)  # shared with the embedding; the engine reads it from there
     source_dir = Path(source_dir)
+    # Tensors that stay Mode A (embeddings, head, norms, routers) go back to the source's dtype:
+    # training them in an FP32 master copy must not double the exported file. BitLinear weights
+    # keep the master precision, since the ternary fit is taken from them.
+    ternary = {f"{n}.weight" for n in names}
+    source_dtypes = _source_dtypes(source_dir)
+    for k, v in tensors.items():
+        want = source_dtypes.get(k)
+        if k not in ternary and want is not None and v.is_floating_point() and v.dtype != want:
+            tensors[k] = v.to(want)
     with tempfile.TemporaryDirectory(prefix="mode-d-") as tmp:
         tmp = Path(tmp)
         save_file(tensors, str(tmp / "model.safetensors"))
