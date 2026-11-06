@@ -64,7 +64,9 @@ case "${1:-}" in
     done
     ;;
   serve)
-    boilerplate serve "$(dir "${2:?variant}")" --host 0.0.0.0 --port "${PORT:-8000}" --max-seq-len 8192
+    # Loopback by default. For HOST=0.0.0.0 export BOILERPLATE_API_KEY first (serve refuses otherwise)
+    # and put a TLS reverse proxy in front; the key is read from the environment, not the command line.
+    boilerplate serve "$(dir "${2:?variant}")" --host "${HOST:-127.0.0.1}" --port "${PORT:-8000}" --max-seq-len 8192
     ;;
   *) sed -n 2,14p "$0"; exit 2 ;;
 esac

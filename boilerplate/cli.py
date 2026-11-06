@@ -394,6 +394,12 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--threads", type=int, default=4, help="PyTorch CPU math threads")
     s.add_argument("--mode-b-cache-mib", type=int, default=256, help="maximum decoded Mode B bytes retained in the LRU (MiB)")
     s.add_argument("--expert-cache-mib", type=int, help="bound on materialized routed experts (default: keep all)")
+    s.add_argument("--api-key", help="require 'Authorization: Bearer KEY' (prefer the BOILERPLATE_API_KEY "
+                                     "environment variable: command lines are visible to other local users)")
+    s.add_argument("--insecure-no-auth", action="store_true",
+                   help="allow a non-loopback --host without an API key (trusted, isolated networks only)")
+    s.add_argument("--max-pending", type=int, default=16, help="queued + running requests before HTTP 503")
+    s.add_argument("--max-body-bytes", type=int, default=4 << 20, help="request body limit (HTTP 413 above it)")
     s.set_defaults(fn=lambda a: __import__("boilerplate.serve", fromlist=["main"]).main(a))
 
     s = sub.add_parser("lm-eval", help="run lm-evaluation-harness tasks in process on a checkpoint (needs lm_eval)")

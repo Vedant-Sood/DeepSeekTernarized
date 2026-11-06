@@ -92,6 +92,8 @@ boilerplate generate ./trunc7 "The capital of France is" --max-new-tokens 16
 ```bash
 # Serve over HTTP (OpenAI-compatible; "stream": true for server-sent events)
 boilerplate serve ./trunc7 --port 8000
+# Binds to 127.0.0.1. For other hosts set BOILERPLATE_API_KEY (clients send
+# 'Authorization: Bearer <key>'); see docs/reports/security_review.md
 curl localhost:8000/v1/chat/completions -d '{"messages":[{"role":"user","content":"Hi"}],"max_tokens":32}'
 
 # lm-evaluation-harness tasks in process (pip install -e ".[eval]")
