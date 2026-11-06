@@ -241,6 +241,20 @@ def _cmd_export(a) -> int:
     return 0
 
 
+def _cmd_agent(a) -> int:
+    from .agent.cli import main as agent_main
+
+    return agent_main(args=a)
+
+
+def _cmd_serve(a) -> int:
+    from .serve import serve
+
+    serve(a.checkpoint, a.host, a.port, api_key_env=a.api_key_env, max_seq_len=a.max_seq_len,
+          max_tokens_cap=a.max_tokens_cap, model_name=a.model_name)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="boilerplate")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -329,6 +343,22 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--calib-len", type=int, default=512, help="GPTQ: tokens per calibration sequence")
     s.add_argument("--calib-layers", help="GPTQ: only calibrate these layer ids (comma-separated)")
     s.set_defaults(fn=_cmd_export)
+
+    s = sub.add_parser("agent", help="interactive coding agent on the engine or any OpenAI-compatible endpoint")
+    from .agent.cli import build_parser as _agent_parser
+
+    _agent_parser(s)
+    s.set_defaults(fn=_cmd_agent)
+
+    s = sub.add_parser("serve", help="OpenAI-compatible HTTP server over the engine (development use)")
+    s.add_argument("checkpoint")
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8000)
+    s.add_argument("--api-key-env", help="require 'Authorization: Bearer <value of this env var>'")
+    s.add_argument("--max-seq-len", type=int, default=8192)
+    s.add_argument("--max-tokens-cap", type=int, default=4096)
+    s.add_argument("--model-name")
+    s.set_defaults(fn=_cmd_serve)
 
     a = p.parse_args(argv)
     return a.fn(a)

@@ -98,6 +98,13 @@ any permission check.
 | `shell` | execute | Runs a command (see section 6.4), returns exit code, stdout and stderr, truncated. |
 | `git` | read or execute | Subcommand allowlist. `status`, `diff`, `log`, `show`, `branch` (list) are read; `add`, `commit`, `checkout`, `switch`, `restore`, `stash` are execute; `push`, `reset --hard`, `clean`, `config`, `remote` and anything else are refused unless explicitly allowed by rule. |
 
+git hardening: global options before the subcommand are refused, as are options that run programs,
+write elsewhere or need a terminal (`--output`, `--ext-diff`, `--no-index`, `-O`, `--exec`, `-i`...,
+including git's abbreviated long options). Every run adds `-c core.fsmonitor=false -c core.pager=cat
+-c diff.external= -c credential.helper= -c protocol.allow=never` and `--no-ext-diff --no-textconv`
+for diff/log/show. If the repository's `.git/config` sets keys that can run programs (`core.fsmonitor`,
+`filter.*`, `diff.*.textconv`, aliases, helpers...), every git call asks and the prompt says why.
+
 Tool output is capped (default 30 000 characters) with a note saying how much was cut.
 
 ## 5. Permissions
@@ -115,6 +122,10 @@ first match wins:
    `*credentials*`, `*.p12`...): reads and writes are `ask`.
 5. **Allow rules** from the user config and the command line, and grants made during the session
    ("always allow this for the session").
+   A shell-allowlist match also counts as allow here, except that a command that runs workspace
+   code (pytest, make, npm, python...) asks if files were written without user review since the
+   last command the user approved. Otherwise `accept-edits` would let a model write a
+   `conftest.py` and run it with no human in the loop.
 6. **Ask rules**.
 7. **Mode default**:
 
@@ -126,7 +137,8 @@ first match wins:
 | `auto` | allow | allow | allow |
 
 In non-interactive mode (`-p`) an `ask` becomes `deny` and the model is told so, unless `--yes`
-was given, which upgrades `ask` from steps 5 to 7 to allow (never steps 1 to 4).
+was given, which upgrades `ask` from ask rules, mode defaults and the allowlist escalation to
+allow (never hard denies, deny rules, plan mode, taint or sensitive paths).
 
 Rules are strings `tool` or `tool(pattern)`, with `fnmatch` patterns over the command line for
 `shell`/`git` and over the workspace-relative path for file tools, for example
@@ -153,19 +165,24 @@ byte in the first 8 KB) are not returned to the model.
 ### 6.3 Environment scrubbing
 
 Subprocesses get a copy of the environment without variables whose names look like credentials
-(`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*CREDENTIAL*`, `AWS_*`, `GH_*`, `GITHUB_*`,
-`HF_*`, `OPENAI_*`, `ANTHROPIC_*`), plus anything listed in `env_passthrough` explicitly re-added
-by the user config only. `GIT_TERMINAL_PROMPT=0` and `PAGER=cat` are set.
+(`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSW*`, `*CREDENTIAL*`, `*AUTH*`, `AWS_*`, `GH_*`, `GITHUB_*`,
+`HF_*`, `OPENAI_*`, `ANTHROPIC_*`) and all `GIT_CONFIG*` variables (they inject git config such as
+auth headers). Variables in `env_passthrough` are re-added; only a trusted config can set it.
+`SSH_AUTH_SOCK` is removed so commands cannot use the user's SSH agent. `GIT_TERMINAL_PROMPT=0` and `PAGER=cat` are set.
 
 ### 6.4 Command execution
 
 - By default commands are tokenised with `shlex` and run without a shell (`shell=False`), so
-  pipes, redirects, `;`, `&&`, backticks and `$(...)` are refused with a clear error. Setting
+  unquoted pipes, redirects, `;`, `&&`, backticks and `$(...)` are refused with a clear error.
+  Quoted text (`python -c "a; b"`) reaches the program literally, since no shell interprets it. Setting
   `shell.allow_shell_syntax: true` (user config only) runs them through `/bin/sh -c` instead.
 - Commands are matched against `shell.allowlist` (default: common read-only and build/test
-  programs) and `shell.denylist` (`sudo`, `su`, `rm -rf /`, `curl`, `wget`, `ssh`, `scp`, `nc`,
-  `dd`, `mkfs`, `chmod -R 777`, ...). The denylist wins. A command on neither list falls through
-  to the mode default.
+  programs) and `shell.denylist` (`sudo`, `su`, `rm -rf`, `curl`, `wget`, `ssh`, `scp`, `nc`, `dd`,
+  `mkfs`, `chmod -R 777`, `pip install`, `git push`...). The denylist wins and is a hard deny. Both
+  look through prefixes such as `env`, `nice`, `timeout` and `xargs`, and the denylist reduces
+  `/usr/bin/curl` to `curl`. A wrapped command never matches the allowlist, nor does `find` with
+  `-exec`/`-delete`, `sh -c`, or an allowlisted program whose path arguments leave the workspace
+  or name a credential file. A command on neither list falls through to the mode default.
 - cwd is the workspace root; stdin is `/dev/null`; the process runs in its own process group; on
   timeout (default 120 s, max 600 s) the whole group is killed.
 - stdout and stderr are read with a byte cap; on POSIX, `RLIMIT_FSIZE`, `RLIMIT_CPU` and
@@ -179,7 +196,7 @@ interpreter can open a socket). Section 6.7 is the real fix.
 
 ### 6.6 Secrets
 
-All text written to transcripts or logs, and all tool output sent to a remote endpoint, passes
+All text written to transcripts and all tool output given to the model (local or remote) passes
 through redaction: private key blocks, `ghp_`/`gho_`/`github_pat_`, `sk-`, `hf_`, AWS access keys,
 `xox[bp]-` Slack tokens, `Bearer` headers, `password=` style assignments, and the literal values of
 credential-looking environment variables present at start-up.
@@ -252,6 +269,9 @@ serialises generation behind a lock. It is a development server, not a multi-ten
    approval, which is checked by a test that runs every tool under `plan` and `default` mode with
    an always-deny prompter.
 
+Status 2026-11-06: all three hold on CPU (`tests/test_agent.py`, `tests/test_serve.py`; criterion 2
+run by hand against `boilerplate make-tiny`, both through `serve` and with `--checkpoint`).
+
 ## 12. Follow-ups
 
 - OS-level sandbox wrapper presets (bwrap, Docker) and a `--sandbox` flag.
@@ -259,3 +279,7 @@ serialises generation behind a lock. It is a development server, not a multi-ten
   once a chat-tuned checkpoint runs on the engine (fits the M5 report).
 - MCP client support, so external tool servers can be attached under the same permission system.
 - A richer TUI (diff viewer, interruptible streaming display).
+- Regex search runs Python `re` on workspace files; a pathological pattern can still backtrack for
+  a long time on one large file. A per-search time budget (or the `regex` module's timeout) would
+  close that.
+- Include `boilerplate/agent/` and `boilerplate/serve.py` in the next whole-codebase security review.

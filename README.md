@@ -102,6 +102,28 @@ QAT checkpoints use a restricted tensor/plain-data loader: the previous version 
 checkpoints are not supported by that loader. See `docs/reports/security_review.md` for the trust
 boundaries and remaining limitations.
 
+## Coding agent and server
+
+`boilerplate agent` is a terminal coding agent: a model reads, searches and edits the repository it
+is started in, runs tests and uses git, through tools gated by a permission system. It drives the
+engine in-process (`--checkpoint DIR`), the engine behind `boilerplate serve`, or any
+OpenAI-compatible endpoint (`--endpoint URL --model NAME --api-key-env VAR`).
+
+```bash
+boilerplate serve ./checkpoint --port 8000          # loopback only unless --api-key-env is set
+boilerplate agent --endpoint http://127.0.0.1:8000/v1 --model checkpoint
+boilerplate agent --checkpoint ./checkpoint -p "summarise src/" --mode plan   # one-shot, read-only
+```
+
+By default reads are allowed and every write or command asks first (`--mode plan|default|
+accept-edits|auto`, `--allow 'shell(pytest *)'`, `--deny RULE`). Paths are confined to the
+workspace, credential files always ask, commands run without a shell, with a scrubbed environment,
+a timeout and output limits, and a repository's own `.boilerplate/agent.yaml` can only tighten
+settings unless you trust that workspace. This is a policy layer, not OS isolation: run untrusted
+repositories in a container. Design, threat model and follow-ups:
+`docs/agent_prompt_coding_cli.md`. The quality of tool use depends on the model; the tiny and
+truncated test checkpoints only exercise the plumbing.
+
 ## Layout
 
 ```
@@ -115,6 +137,8 @@ boilerplate/
   ternary/      TQ1/TQ2 packing, stacked-ternary and GPTQ fitting, ternary linear
   reference/    traces, comparison, official + HF backends
   testing/      tiny checkpoint writer, truncated real-checkpoint slicer
+  agent/        terminal coding agent: loop, tools, permissions, sandbox, sessions, backends
+  serve.py      minimal OpenAI-compatible HTTP server over the engine
 third_party/    official DeepSeek V4.1 inference code (MIT), the trusted reference
 configs/        source checkpoint id, precision policies (configs/policy/)
 docs/           architecture notes and milestone reports
