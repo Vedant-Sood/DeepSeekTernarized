@@ -14,8 +14,8 @@ everything that does not need approved hardware: the standard decoder (Llama/OLM
 trainer with FSDP2, offline distillation, exact resume and Mode D / GGUF export, the compute
 estimator and launch scripts, a resumable streaming converter, a tiered expert cache, an
 OpenAI-compatible server and an lm-eval-harness adapter. **Not run yet:** any QAT on a
-pretrained model, anything on a GPU (the CUDA Huffman and ternary kernels have not been compiled
-or run), and every full-model conversion and evaluation. Those are gated on Vedant's approval of
+pretrained model, anything on a GPU (the CUDA Huffman and ternary kernels compile for sm_89 but have
+never run; `scripts/launch/gpu_day.sh` is the first-GPU checklist), and every full-model conversion and evaluation. Those are gated on Vedant's approval of
 hardware and budget. The pre-registered M4 verdict is untested. See `docs/reports/`
 (`small_model_ternary.md` is M4, `M5.md` lists what is built, not built and not run),
 `docs/architecture/format.md` for the on-disk format,

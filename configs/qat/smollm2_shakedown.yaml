@@ -7,8 +7,8 @@ train_tokens: work/data/fineweb_edu_smollm2.bin   # boilerplate qat-tokenize (Sm
 out_dir: work/qat/smollm2_shakedown
 token_budget: 500000000                      # 0.5 B tokens (plan: 2 B on a 24-80 GB GPU)
 seq_len: 2048
-micro_batch: 4
-grad_accum: 8                                # 65,536 tokens per optimizer step
+micro_batch: 2                                # logits of student + online teacher (49k vocab) fit 8 GB
+grad_accum: 16                               # 65,536 tokens per optimizer step
 lr: 1.5e-4
 min_lr: 1.5e-5
 lr_warmup_steps: 200
