@@ -17,7 +17,8 @@ group: 128
 master_dtype: bf16
 optimizer: adamw8bit                         # bitsandbytes; fits weights+grads+state in ~2.2 GB
 gradient_checkpointing: true
-teacher_dir: work/qat/smollm2_teacher_top32  # boilerplate qat-teacher (k=32); remove for CE only
+teacher_model: work/models/smollm2-360m           # online BF16 teacher (top-32 KL); offline: teacher_dir from qat-teacher
+teacher_k: 32
 kl_weight: 0.5
 packing: tq1
 log_every: 10

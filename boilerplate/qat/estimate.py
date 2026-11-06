@@ -5,7 +5,9 @@ tensor shapes (read from safetensors headers; nothing is loaded) and the hardwar
 
 * parameters: total, routed-expert, and active per token (MoE: ``k / E`` of the expert weights);
 * training FLOPs ``6 * active * tokens`` (forward + backward; BitLinear's quantize/dequantize is
-  elementwise and ignored), plus the teacher's ``2 * active_teacher * tokens`` when distilling;
+  elementwise and ignored), plus the teacher's ``2 * active_teacher * tokens`` when distilling
+  (inside the step for an online teacher, once beforehand for offline top-k, which also costs
+  ``tokens * (4k + 4)`` bytes of disk: 132 B/token at k = 32);
 * GPU memory per device: master weights, gradients and optimizer state (FSDP divides all three by
   the world size), plus an activation term per micro batch (rough; checkpointing shrinks it);
 * time and cost: from a **measured** throughput (``tok_s`` from a probe run's log) when given,
@@ -67,7 +69,11 @@ def estimate(cfg, *, world: int = 1, gpu: str = "h100", mfu: float = 0.35, tok_s
     steps = plan(cfg, world)
     tokens = steps["total_steps"] * steps["tokens_per_step"]
     train_flops = 6 * p["active"] * tokens
-    teacher_flops = 2 * (teacher_params or p["active"]) * tokens if cfg.teacher_dir else 0
+    teacher_active = teacher_params or p["active"]
+    online = bool(getattr(cfg, "teacher_model", None))
+    teacher_flops = 2 * teacher_active * tokens if (cfg.teacher_dir or online) else 0
+    # offline top-k on disk: k int16/int32 ids + k fp16 log-probs + one fp32 tail per token
+    teacher_disk = tokens * (getattr(cfg, "teacher_k", 32) * (2 + 2) + 4) if cfg.teacher_dir else 0
     w = BYTES[cfg.master_dtype]
     opt = 2 * (1 if cfg.optimizer == "adamw8bit" else 4)  # two moments per parameter
     state = p["total"] * (w + w + opt)  # weights + grads + optimizer
@@ -76,17 +82,21 @@ def estimate(cfg, *, world: int = 1, gpu: str = "h100", mfu: float = 0.35, tok_s
     # checkpointing (Korthikanti et al. 2022, attention scores excluded); ~2 with checkpointing.
     per = 2 if cfg.gradient_checkpointing else 34
     activations = per * cfg.seq_len * cfg.micro_batch * hidden * layers
-    per_gpu = state / world + activations
+    teacher_weights = p["total"] * BYTES.get(getattr(cfg, "teacher_dtype", "bf16"), 2) if online else 0
+    per_gpu = state / world + activations + teacher_weights  # the online teacher is replicated
     if tok_s:
         basis = f"measured {tok_s:,.0f} tok/s across {world} GPU(s)"
         seconds = tokens / tok_s
     else:
         basis = f"assumed MFU {mfu:.0%} of {gpu} peak {hw['flops'] / 1e12:.0f} TFLOP/s (BF16 dense)"
-        seconds = train_flops / (world * hw["flops"] * mfu)
+        # an online teacher's forward runs inside the training step
+        seconds = (train_flops + (teacher_flops if online else 0)) / (world * hw["flops"] * mfu)
     gpu_hours = seconds * world / 3600
     out = {
         "params": p, "tokens": tokens, **steps,
-        "train_flops": train_flops, "teacher_precompute_flops": teacher_flops,
+        "train_flops": train_flops, "teacher_flops": teacher_flops,
+        "teacher_mode": "online" if online else ("offline" if cfg.teacher_dir else "none"),
+        "teacher_disk_bytes": int(teacher_disk), "teacher_weight_bytes_per_gpu": int(teacher_weights),
         "memory_per_gpu_bytes": int(per_gpu), "state_bytes_total": int(state), "activation_bytes": int(activations),
         "fits": per_gpu < 0.9 * hw["vram"], "gpu": gpu, "world": world,
         "wall_clock_hours": seconds / 3600, "gpu_hours": gpu_hours, "throughput_basis": basis,

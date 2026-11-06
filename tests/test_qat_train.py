@@ -171,3 +171,72 @@ def test_mode_d_export_keeps_source_dtype_for_mode_a_tensors(tmp_path):
     embed = [k for k in dtypes if "embed_tokens" in k]
     assert embed and all(dtypes[k] == "BF16" for k in embed)
     assert manifest["tensors"]["model.layers.0.mlp.down_proj"]["mode"] == "D"
+
+
+def test_streaming_tokenizer_txt_and_jsonl(tmp_path):
+    from boilerplate.qat.data import tokenize_text_file
+    from boilerplate.testing.tiny import tiny_tokenizer
+
+    tok = tiny_tokenizer(64)
+    tok.save(str(tmp_path / "tok.json"))
+    lines = [" ".join(f"w{(i * 7 + j) % 15}" for j in range(i % 9 + 1)) for i in range(200)]
+    (tmp_path / "c.txt").write_text("\n".join(lines) + "\n")
+    out = tokenize_text_file(tmp_path / "c.txt", tmp_path / "tok.json", tmp_path / "c.bin", chunk_chars=37)
+    whole = tok.encode("\n".join(lines) + "\n", add_special_tokens=False).ids
+    assert TokenWindows(out, 1).tokens.tolist() == whole
+    (tmp_path / "d.jsonl").write_text("".join(json.dumps({"text": t}) + "\n" for t in lines[:5]))
+    out = tokenize_text_file(tmp_path / "d.jsonl", tmp_path / "tok.json", tmp_path / "d.bin")
+    meta = json.loads(out.with_suffix(".json").read_text())
+    assert meta["documents"] == 5 and meta["eos_id"] == 1  # "</s>"
+    want = [t for line in lines[:5] for t in tok.encode(line, add_special_tokens=False).ids + [1]]
+    assert TokenWindows(out, 1).tokens.tolist() == want
+    assert meta["sha256"] == __import__("hashlib").sha256(np.asarray(want, dtype=np.uint16).tobytes()).hexdigest()
+
+
+def test_prepare_data_local_parquet_and_jsonl_gz(tmp_path):
+    import gzip
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from boilerplate.qat.prepare_data import prepare
+
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(3):
+        pq.write_table(pa.table({"text": [f"p{i} doc {j} " * 5 for j in range(20)]}), src / f"{i:03d}.parquet")
+    for i in range(2):
+        with gzip.open(src / f"w{i}.json.gz", "wt") as f:
+            for j in range(20):
+                f.write(json.dumps({"text": f"g{i} doc {j} " * 5}) + "\n")
+    out = prepare(tmp_path / "data", [f"{src}:*.parquet:3", f"{src}:w*.json.gz:1"], train_chars=2400,
+                  heldout_chars=400, log=lambda *_: None)
+    train = [json.loads(l)["text"] for l in open(out / "train.jsonl")]
+    held = [json.loads(l)["text"] for l in open(out / "heldout.jsonl")]
+    assert not set(train) & set(held)
+    assert all(t.startswith(("p2", "g1")) for t in held)  # last file of each source
+    assert not any(t.startswith(("p2", "g1")) for t in train)
+    rec = json.loads((out / "data.json").read_text())
+    p, g = rec["sources"]
+    assert p["train_chars"] >= 1800 and g["train_chars"] >= 600 and g["train_chars"] < 1800
+    assert rec["train_docs"] == len(train) and rec["heldout_docs"] == len(held)
+
+
+def test_online_teacher_matches_offline(tmp_path):
+    from boilerplate.qat.teacher import precompute
+
+    off = _cfg(tmp_path, "llama", token_budget=16 * 2 * 3, out_dir=str(tmp_path / "off"))
+    windows = TokenWindows(off.train_tokens, off.seq_len)
+    teacher = transformers.AutoModelForCausalLM.from_pretrained(off.source)
+    off.teacher_dir = str(precompute(teacher, windows, tmp_path / "t", list(range(len(windows))), k=8,
+                                     log=lambda *_: None))
+    train(off, log=lambda *_: None)
+    on = _cfg(tmp_path, "llama", token_budget=16 * 2 * 3, out_dir=str(tmp_path / "on"),
+              teacher_model=off.source, teacher_k=8, teacher_dtype="fp32")
+    train(on, log=lambda *_: None)
+    a = [json.loads(l)["loss"] for l in open(tmp_path / "off" / "log.rank0.jsonl")]
+    b = [json.loads(l)["loss"] for l in open(tmp_path / "on" / "log.rank0.jsonl")]
+    assert a == pytest.approx(b, rel=2e-3)  # offline stores fp16 log-probs
+    bad = _cfg(tmp_path, "llama", out_dir=str(tmp_path / "bad"), teacher_dir=off.teacher_dir, seq_len=8)
+    with pytest.raises(SystemExit, match="teacher"):
+        train(bad, log=lambda *_: None)

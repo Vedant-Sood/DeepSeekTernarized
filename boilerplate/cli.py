@@ -266,7 +266,7 @@ def _cmd_cast(a) -> int:
 def _cmd_qat_tokenize(a) -> int:
     from .qat.data import tokenize_text_file
 
-    out = tokenize_text_file(a.text, a.tokenizer, a.out)
+    out = tokenize_text_file(a.text, a.tokenizer, a.out, eos_token=a.eos_token)
     print(out.with_suffix(".json").read_text())
     return 0
 
@@ -431,11 +431,20 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     s.set_defaults(fn=_cmd_cast)
 
-    s = sub.add_parser("qat-tokenize", help="tokenize a text file into a QAT token file (.bin + .json)")
-    s.add_argument("text")
+    s = sub.add_parser("qat-tokenize", help="tokenize a .txt or .jsonl corpus into a QAT token file (.bin + .json)")
+    s.add_argument("text", help=".txt (running text) or .jsonl (one {\"text\": ...} document per line, EOS between)")
     s.add_argument("tokenizer", help="tokenizer.json")
     s.add_argument("out", help="output .bin")
+    s.add_argument("--eos-token", help="document separator for .jsonl (default: the tokenizer's usual EOS)")
     s.set_defaults(fn=_cmd_qat_tokenize)
+
+    s = sub.add_parser("qat-data", help="stream a training corpus + disjoint held-out split from HF datasets (jsonl)")
+    s.add_argument("out_dir")
+    s.add_argument("--source", action="append", required=True,
+                   help="repo_id:glob:weight or local_dir:glob:weight, e.g. HuggingFaceFW/fineweb-edu:sample/10BT/*.parquet:1")
+    s.add_argument("--train-chars", type=float, required=True, help="characters of training text (~4 per token)")
+    s.add_argument("--heldout-chars", type=float, default=2e7)
+    s.set_defaults(fn=lambda a: __import__("boilerplate.qat.prepare_data", fromlist=["main"]).main(a))
 
     s = sub.add_parser("qat-teacher", help="precompute teacher top-k log-probs per training window (offline distillation)")
     s.add_argument("teacher", help="HF checkpoint of the unquantized teacher")

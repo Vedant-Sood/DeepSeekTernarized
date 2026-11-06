@@ -6,7 +6,8 @@
 What one run does: load the BF16 source, swap block linears for BitLinear, freeze routers,
 optionally FSDP-shard, then train on fixed-length windows of a token file with AdamW, linear LR
 warmup + cosine decay, the lambda warmup (full precision → fully ternary over
-``quant_warmup_steps``), CE or CE + KL to stored teacher top-k, gradient clipping. It logs JSON
+``quant_warmup_steps``), CE or CE + KL to the teacher's top-k (stored offline, or computed online
+by a resident teacher), gradient clipping. It logs JSON
 lines (loss, LR, lambda, tokens, throughput, routing drift on a fixed probe batch), checkpoints
 every ``checkpoint_every`` steps and at the end, resumes exactly from the latest checkpoint, and
 exports Mode D at the end.
@@ -56,6 +57,10 @@ class RunConfig:
     optimizer: str = "adamw"         # "adamw" or "adamw8bit" (bitsandbytes, for 8 GB GPUs)
     gradient_checkpointing: bool = False
     teacher_dir: str | None = None   # offline teacher top-k (``qat-teacher``); None = CE only
+    teacher_model: str | None = None # online teacher: HF checkpoint run alongside (no stored top-k)
+    teacher_k: int = 32              # online teacher: top-k kept per position
+    teacher_temperature: float = 1.0
+    teacher_dtype: str = "bf16"
     kl_weight: float = 0.5
     seed: int = 0
     log_every: int = 10
@@ -102,7 +107,7 @@ def train(cfg: RunConfig, log=print) -> dict:
 
     from .bitlinear import warmup_level
     from .data import Sampler, TokenWindows, batch
-    from .distill import distillation_loss
+    from .distill import distillation_loss, teacher_topk
     from .distributed import load_sharded, save_sharded, set_quantization_level, shard
     from .model import load_for_qat
     from .routing import RoutingDrift, capture_hf_routing
@@ -131,7 +136,18 @@ def train(cfg: RunConfig, log=print) -> dict:
     params = [q for q in model.parameters() if q.requires_grad]
     optimizer = _optimizer(params, cfg)
     windows = TokenWindows(cfg.train_tokens, cfg.seq_len)
-    teacher, pool = None, None
+    teacher, pool, online = None, None, None
+    if cfg.teacher_dir and cfg.teacher_model:
+        raise SystemExit("set teacher_dir (offline top-k) or teacher_model (online), not both")
+    if cfg.teacher_model:
+        # Online distillation: the unquantized teacher runs next to the student on every rank
+        # (no stored top-k; costs one extra forward per micro batch and the teacher's weights).
+        from transformers import AutoModelForCausalLM
+
+        online = AutoModelForCausalLM.from_pretrained(cfg.teacher_model, dtype=DTYPES[cfg.teacher_dtype]).to(device)
+        online.eval().requires_grad_(False)
+        if online.config.vocab_size != model.config.vocab_size:
+            raise SystemExit("teacher and student vocabularies differ")
     if cfg.teacher_dir:
         from .teacher import TeacherStore
 
@@ -215,7 +231,11 @@ def train(cfg: RunConfig, log=print) -> dict:
             x, y = batch(windows, ids)
             x, y = x.to(device), y.to(device)
             logits = model(x).logits
-            if teacher is not None:
+            if online is not None:
+                with torch.no_grad():
+                    t = teacher_topk(online(x).logits, cfg.teacher_k, cfg.teacher_temperature)
+                loss = distillation_loss(logits, y, t, kl_weight=cfg.kl_weight)
+            elif teacher is not None:
                 loss = distillation_loss(logits, y, teacher.get(ids), kl_weight=cfg.kl_weight)
             else:
                 loss = torch.nn.functional.cross_entropy(logits.float().flatten(0, 1), y.flatten())
