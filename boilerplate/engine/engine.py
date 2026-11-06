@@ -65,11 +65,16 @@ class Engine:
             # tensor KV cache, rather than the V4 dequantization cache and paged KV allocator.
             if dequant_cache_bytes != 2 << 30:
                 raise ValueError("standard decoder does not implement the V4 dequantization cache")
+            device = cache_args.pop("device", None)
             if cache_args.pop("page_size", 64) != 64:
                 raise ValueError("standard decoder does not implement paged KV")
             return StandardEngine.load(path, max_seq_len=max_seq_len, tokenizer_path=tokenizer_path,
                                        mode_b_cache_bytes=mode_b_cache_bytes, expert_cache_bytes=expert_cache_bytes,
-                                       **cache_args)
+                                       device=device, **cache_args)
+        if cache_args.pop("ternary_backend", "auto") != "auto":
+            raise ValueError("ternary_backend applies to the Llama/OLMoE decoder")
+        if cache_args.pop("device", None) not in (None, "cpu"):
+            raise ValueError("the V4.1 engine runs on CPU only so far; device= applies to Llama/OLMoE")
         cfg = EngineConfig.from_hf(config)
         tok = load_tokenizer(tokenizer_path or path)
         model = V4Model(cfg, WeightStore(path, mode_b_cache_bytes=mode_b_cache_bytes), tokenizer=tok,
@@ -106,6 +111,18 @@ class Engine:
             logits=torch.cat(logits, 1),
             meta={"backend": "boilerplate", "mode": "A", "decode_from": decode_from, "hidden_semantics": "output of each Block: full hyper-connection stream [b, s, hc_mult, dim]"},
         )
+
+    def routing(self, input_ids: list[int]) -> list[torch.Tensor]:
+        """Experts chosen in every MoE layer for each token of one prefill ([tokens, top_k] each)."""
+        cache = self.new_cache()
+        seq = cache.new_sequence()
+        self.model.routing_capture = []
+        try:
+            self.model.forward([(seq, list(input_ids))], cache)
+            return self.model.routing_capture
+        finally:
+            self.model.routing_capture = None
+            cache.free(seq)
 
     # ------------------------------------------------------------------ generation
     def generate(

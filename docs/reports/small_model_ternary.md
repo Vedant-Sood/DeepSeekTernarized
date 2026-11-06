@@ -302,3 +302,62 @@ Next, all gated on Vedant: approve the SmolLM2 probe and shakedown budget (then
 `scripts/launch/smollm2_shakedown.sh prepare|probe|train|eval`), and the OLMoE budget
 (`scripts/launch/olmoe_qat.sh`). The OLMoE baselines and PTQ arms need a machine with more than
 this container's 15 GB RAM; llama.cpp runs need a machine where building it is allowed.
+
+## Follow-up, 2026-11-06: pre-GPU fixes and GPU-day tooling
+
+Done before GPU access, so GPU time goes to measurements. Still **no pretrained-model training
+and no GPU run**.
+
+* **Real-model CPU smoke.** Three QAT steps of the real SmolLM2-360M ran on CPU (seq 128, offline
+  teacher, Mode D export). They found and fixed three problems:
+  * The sampler drew windows the teacher had not covered. It now trains only on covered windows,
+    and refuses a teacher built for another sequence length or token file.
+  * Mode D export wrote embeddings and norms in the FP32 master dtype, which made the file 260 MB
+    instead of ~165 MB. They are now written in the source's dtype.
+  * The tokenizer read the whole corpus into Python lists. That needs about 280 GB of RAM for
+    10 B tokens. It now streams.
+* **Export parity on the real model.** Logits of the exported model differ from the training
+  graph's by 0.95 at most (4.6 % of the largest logit), and 92 % of greedy tokens agree. Layers
+  0–2 agree to 1e-6, and the difference grows from layer 3 onward. This comes from the int8
+  activation rounding, not from the export. Scaling the training graph's own input embeddings by
+  (1 + 1e-6) changes its logits by 0.70 at most (3.4 %). So agreement to that level is all that can
+  be expected after three steps. The tiny-model parity test (2e-3) still holds.
+* **Online teacher.** `teacher_model:` runs the BF16 teacher next to the student and takes its
+  top-k every step. Offline top-k at k = 32 costs 132 bytes per token, which is about 66 GB for the
+  0.5 B-token shakedown and about 1.3 TB for OLMoE at 10 B. All committed configs now use the online
+  teacher; `teacher_dir` still works. Online and offline give the same losses (fp16 rounding aside).
+* **Data.** `boilerplate qat-data` streams a corpus from Hub datasets by range requests: FineWeb-Edu
+  for SmolLM2, and OLMoE-mix-0924 weighted by its subset token counts. It holds out each source's
+  last file as a disjoint held-out split. `qat-tokenize` takes that JSONL and puts EOS between
+  documents. `scripts/eval/get_wikitext2.py` writes WikiText-2 byte-identically to the text every
+  perplexity in this report used.
+* **GPU path for the Llama/OLMoE engine.** `device="cuda"` (`--device cuda` on `bench`, `serve`,
+  `lm-eval` and the perplexity script) keeps weights resident and runs ternary layers with the CUDA
+  kernel. On CPU, the materialized path matches the mmap path. A CUDA parity test is ready for the
+  GPU.
+* **CUDA kernels compile.** `scripts/dev/cuda_compile_check.sh` builds both CUDA sources for sm_89
+  (the RTX 4060) with clang's CUDA front end and NVIDIA's ptxas, without a GPU. The ternary kernel
+  uses 68–70 registers with no spills (a spill was fixed). They have still never run.
+* **QAT MoE dispatch.** One sort per layer replaces a full scan per expert. Outputs and gradients
+  are identical.
+* **Routing drift** for any MoE checkpoint against its source: `scripts/eval/routing_drift.py`,
+  with routing capture in both engines.
+* **`scripts/launch/gpu_day.sh`** runs, in order: environment check, CUDA build, every test
+  (the CUDA ones must not skip), kernel benchmark, engine decode benchmark (BF16 vs absmean TQ1,
+  batch 1 and 8), and the 20-step throughput probe with the measured estimate. Results go to one
+  folder.
+
+### Updated estimates (online teacher)
+
+The online teacher's forward pass now counts inside each step, which adds about one third to the
+compute. The shakedown micro batch drops to 2 (with gradient accumulation 16) so the student's and
+the teacher's 49k-vocabulary logits fit in 8 GB.
+
+| Run | Memory / GPU (weights + state + teacher) | Wall clock at MFU 10% / 20% / 40% | GPU-hours at the same |
+|---|---|---|---|
+| SmolLM2 shakedown, 0.5 B, RTX 4060 laptop | 2.9 GiB + activations and logits | 67 h / 34 h / 17 h | same |
+| OLMoE 1 B, 4 × H100 | 32.7 GiB | 7.2 h / 3.6 h / 1.8 h | 29 / 14 / 7 |
+| OLMoE 3 B, 4 × H100 | 32.7 GiB | 22 h / 11 h / 5.4 h | 86 / 43 / 22 |
+| OLMoE 10 B, 4 × H100 | 32.7 GiB | 72 h / 36 h / 18 h | 288 / 144 / 72 |
+
+The 20-step probe in `gpu_day.sh` replaces the MFU assumption with a measured rate.

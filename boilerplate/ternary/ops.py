@@ -79,5 +79,8 @@ class TernaryLinear:
                 e.ternary_gemm(out, q.contiguous(), s.float().contiguous(), t.packed.contiguous(), sc, self.K, self.group, fmt, _TQ1_LUT)
         else:
             xa = q.float() * s.unsqueeze(-1) if self.act == "int8" else q
-            out = xa @ self.dequantized().to(xa.device).t()
+            deq = self.dequantized()
+            if deq.device != xa.device:  # keep one copy on the input's device
+                self._deq = deq = deq.to(xa.device)
+            out = xa @ deq.t()
         return out.view(*shape[:-1], -1).to(out_dtype)

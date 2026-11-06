@@ -260,6 +260,7 @@ class V4Model:
         QLinear.cache = DequantCache(dequant_cache_bytes) if dequant_cache_bytes else None
         self.w = weights
         self.max_seq_len = max_seq_len
+        self.routing_capture: list | None = None  # set to a list to record each MoE layer's top-k ids
         blk = cfg.fp8_block
         self.engram_layout = EngramLayout.from_config(cfg.engram)
         self.hasher = None
@@ -407,6 +408,8 @@ class V4Model:
         shape = x.size()
         x = x.view(-1, self.cfg.dim)
         weights, indices = self.route(L, x)
+        if self.routing_capture is not None:  # routing-drift measurement: experts chosen per token
+            self.routing_capture.append(indices.clone())
         y = torch.zeros_like(x, dtype=torch.float32)
         counts = torch.bincount(indices.flatten(), minlength=self.cfg.n_routed_experts).tolist()
         for e, c in enumerate(counts):  # grouped: each expert runs once over all its tokens

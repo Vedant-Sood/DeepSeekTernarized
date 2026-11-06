@@ -57,6 +57,7 @@ case "${1:-}" in
       python scripts/eval/standard_ppl.py "$d" "$WIKI" --ctx 2048 --out "$r/ppl_wikitext2.json"
       python scripts/eval/standard_ppl.py "$d" "$C4" --ctx 2048 --out "$r/ppl_c4.json"
       boilerplate lm-eval "$d" --tasks mmlu,gsm8k,humaneval --out "$r/lm_eval.json" --max-seq-len 4096
+      [ "$v" = A ] || python scripts/eval/routing_drift.py "$SRC" "$d" "$WIKI" --ctx 512 --windows 16 --out "$r/routing_drift.json"
       boilerplate bench "$d" --prompt-len 512 --gen-len 64 --batch 1 --expert-cache-mib 65536 > "$r/bench_b1.json"
       boilerplate bench "$d" --prompt-len 512 --gen-len 64 --batch 8 --expert-cache-mib 65536 > "$r/bench_b8.json"
       du -b "$d"/*.safetensors | awk '{s+=$1} END {print s}' > "$r/bytes.txt"

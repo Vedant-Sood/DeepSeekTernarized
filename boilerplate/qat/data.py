@@ -39,24 +39,91 @@ def write_tokens(ids, out: str | Path, *, vocab_size: int, tokenizer_sha256: str
     return out
 
 
+class _TokenWriter:
+    """Appends token ids to a ``.bin`` file in chunks, hashing as it goes (constant memory)."""
+
+    def __init__(self, out: Path, vocab_size: int):
+        self.out, self.vocab = out, vocab_size
+        self.dtype = np.uint16 if vocab_size <= 1 << 16 else np.uint32
+        out.parent.mkdir(parents=True, exist_ok=True)
+        self.f = out.open("wb")
+        self.sha = hashlib.sha256()
+        self.count = 0
+
+    def add(self, ids) -> None:
+        arr = np.asarray(ids, dtype=np.int64)
+        if arr.size and (int(arr.max()) >= self.vocab or int(arr.min()) < 0):
+            raise ValueError("token id outside the vocabulary")
+        raw = arr.astype(self.dtype).tobytes()
+        self.f.write(raw)
+        self.sha.update(raw)
+        self.count += arr.size
+
+    def close(self, **meta) -> Path:
+        self.f.close()
+        info = {"dtype": np.dtype(self.dtype).name, "tokens": self.count, "vocab_size": self.vocab,
+                "sha256": self.sha.hexdigest(), **meta}
+        self.out.with_suffix(".json").write_text(json.dumps(info, indent=2))
+        return self.out
+
+
+EOS_CANDIDATES = ("<|endoftext|>", "<|end_of_text|>", "</s>", "<|im_end|>", "<eos>")
+
+
 def tokenize_text_file(text_path: str | Path, tokenizer_path: str | Path, out: str | Path,
-                       *, chunk_chars: int = 1 << 22) -> Path:
-    """Tokenize a UTF-8 text file (no BOS, no special-token parsing) into a token file."""
+                       *, chunk_chars: int = 1 << 22, eos_token: str | None = None) -> Path:
+    """Tokenize a corpus into a token file, streaming (constant memory at any corpus size).
+
+    A ``.txt`` file is encoded as running text (no BOS, no special-token parsing), cut at newlines
+    into chunks. A ``.jsonl`` file holds one document per line (``{"text": ...}``); documents are
+    encoded in batches and separated by the EOS token (``eos_token``, or the first of
+    ``EOS_CANDIDATES`` the tokenizer knows), the usual pretraining layout.
+    """
     from tokenizers import Tokenizer
 
+    text_path = Path(text_path)
     tok = Tokenizer.from_file(str(tokenizer_path))
-    text = Path(text_path).read_text(encoding="utf-8")
-    # Chunk on newlines so a long corpus does not need one giant encode call.
-    chunks, start = [], 0
-    while start < len(text):
-        end = min(len(text), start + chunk_chars)
-        if end < len(text):
-            nl = text.rfind("\n", start, end)
-            end = nl + 1 if nl > start else end
-        chunks.append(tok.encode(text[start:end], add_special_tokens=False).ids)
-        start = end
     sha = hashlib.sha256(Path(tokenizer_path).read_bytes()).hexdigest()
-    return write_tokens(chunks, out, vocab_size=tok.get_vocab_size(), tokenizer_sha256=sha, source=str(text_path))
+    w = _TokenWriter(Path(out), tok.get_vocab_size())
+    meta = {"tokenizer_sha256": sha, "source": str(text_path)}
+    if text_path.suffix == ".jsonl":
+        names = [eos_token] if eos_token else list(EOS_CANDIDATES)
+        eos = next((tok.token_to_id(n) for n in names if tok.token_to_id(n) is not None), None)
+        if eos is None:
+            raise ValueError(f"no EOS token among {names} in {tokenizer_path}; pass eos_token")
+        docs, batch = 0, []
+
+        def flush():
+            for enc in tok.encode_batch(batch, add_special_tokens=False):
+                w.add(enc.ids + [eos])
+            batch.clear()
+
+        with text_path.open(encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    batch.append(json.loads(line)["text"])
+                    docs += 1
+                    if len(batch) == 1024:
+                        flush()
+        flush()
+        meta.update(documents=docs, eos_id=eos)
+        return w.close(**meta)
+    with text_path.open(encoding="utf-8") as f:
+        carry = ""
+        while True:
+            block = f.read(chunk_chars)
+            text = carry + block
+            if not block:
+                if text:
+                    w.add(tok.encode(text, add_special_tokens=False).ids)
+                break
+            nl = text.rfind("\n")
+            if nl < 0:
+                carry = text
+                continue
+            w.add(tok.encode(text[:nl + 1], add_special_tokens=False).ids)
+            carry = text[nl + 1:]
+    return w.close(**meta)
 
 
 class TokenWindows:

@@ -26,33 +26,51 @@ def _value(weight):
 
 
 class _Linear:
-    def __init__(self, store: WeightStore, base: str, dtype: torch.dtype, ternary_backend: str = "auto"):
+    def __init__(self, store: WeightStore, base: str, dtype: torch.dtype, ternary_backend: str = "auto",
+                 device: torch.device | None = None):
         self.meta = store.mode_of(base)
         self.bias = store.maybe_ref(base + ".bias")
         self.ternary = None
+        self.dense = None  # materialized dense weight on ``device`` (GPU path)
+        if device is not None and self.bias is not None:
+            self.bias = _value(self.bias).to(device)
         if self.meta["mode"] in ("C", "D"):
             terms = [PackedTerm(store.get(f"{base}.tq{i}.packed"), store.get(f"{base}.tq{i}.scale"))
                      for i in range(self.meta["terms"])]
             self.ternary = TernaryLinear(terms, self.meta["shape"][1], self.meta["packing"],
                                          self.meta["group"], self.meta["act"], backend=ternary_backend)
             self.linear = None
+        elif device is not None:
+            # GPU path: decode (Mode B) or read once, keep the weight resident on the device
+            self.dense, self.linear = store.get(base + ".weight").to(device=device, dtype=dtype), None
         else:
             self.linear = QLinear(store.ref(base + ".weight"), weight_dtype=dtype)
             self.linear.name = base  # GPTQ calibration looks inputs up by weight base name
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.ternary(x, out_dtype=x.dtype) if self.ternary is not None else self.linear(x)
+        if self.ternary is not None:
+            y = self.ternary(x, out_dtype=x.dtype)
+        elif self.dense is not None:
+            y = F.linear(x, self.dense)
+        else:
+            y = self.linear(x)
         return y if self.bias is None else y + _value(self.bias).to(y.dtype)
 
 
 class StandardDecoder:
     def __init__(self, path: str | Path, *, dtype: torch.dtype = torch.float32,
                  mode_b_cache_bytes: int = 256 << 20, ternary_backend: str = "auto",
-                 expert_cache_bytes: int | None = None):
+                 expert_cache_bytes: int | None = None, device: str | torch.device | None = None):
         """``ternary_backend``: "auto"/"cpp" run the C++ add/subtract kernel; "torch" multiplies the
-        int8-quantized activations by a cached FP32 dequantized weight (same values, BLAS speed)."""
+        int8-quantized activations by a cached FP32 dequantized weight (same values, BLAS speed).
+
+        ``device`` (e.g. "cuda"): materialize every dense weight, norm and the embedding on that
+        device once, keep the KV cache there, and run ternary layers with the CUDA kernel (or the
+        dequantized fallback, cached on the device). None keeps the CPU path that reads weights
+        from the memory-mapped files on demand."""
         self.path = Path(path)
         self.ternary_backend = ternary_backend
+        self.device = torch.device(device) if device is not None else None
         from .expert_cache import ExpertCache
 
         # MoE experts are built on first use; this bounds how many stay materialized (None: all)
@@ -77,7 +95,7 @@ class StandardDecoder:
         head_name = "lm_head" if "lm_head.weight" in self.store or self.store.mode_of("lm_head")["mode"] in ("C", "D") else None
         if head_name is None and not c.get("tie_word_embeddings", False):
             raise ValueError("checkpoint lacks an LM head and does not declare tied embeddings")
-        self.head = _Linear(self.store, head_name, dtype, self.ternary_backend) if head_name else None
+        self.head = _Linear(self.store, head_name, dtype, self.ternary_backend, self.device) if head_name else None
         self.final_norm = self.store.ref("model.norm.weight")
         self.layers = []
         for index in range(c["num_hidden_layers"]):
@@ -86,10 +104,10 @@ class StandardDecoder:
             layer = SimpleNamespace(
                 input_norm=self.store.ref(base + ".input_layernorm.weight"),
                 post_norm=self.store.ref(base + ".post_attention_layernorm.weight"),
-                q=_Linear(self.store, attn + ".q_proj", dtype, self.ternary_backend),
-                k=_Linear(self.store, attn + ".k_proj", dtype, self.ternary_backend),
-                v=_Linear(self.store, attn + ".v_proj", dtype, self.ternary_backend),
-                o=_Linear(self.store, attn + ".o_proj", dtype, self.ternary_backend),
+                q=_Linear(self.store, attn + ".q_proj", dtype, self.ternary_backend, self.device),
+                k=_Linear(self.store, attn + ".k_proj", dtype, self.ternary_backend, self.device),
+                v=_Linear(self.store, attn + ".v_proj", dtype, self.ternary_backend, self.device),
+                o=_Linear(self.store, attn + ".o_proj", dtype, self.ternary_backend, self.device),
                 q_norm=self.store.maybe_ref(attn + ".q_norm.weight"),
                 k_norm=self.store.maybe_ref(attn + ".k_norm.weight"),
                 prefix=base + ".mlp", experts={},
@@ -99,13 +117,20 @@ class StandardDecoder:
             if c["model_type"] == "llama":
                 layer.mlp = self._mlp(layer.prefix)
             else:
-                layer.router = _Linear(self.store, layer.prefix + ".gate", dtype, self.ternary_backend)
+                layer.router = _Linear(self.store, layer.prefix + ".gate", dtype, self.ternary_backend, self.device)
             self.layers.append(layer)
+        if self.device is not None:
+            dev = lambda r: None if r is None else _value(r).to(self.device)  # noqa: E731
+            self.embedding = _value(self.embedding).to(device=self.device, dtype=dtype)
+            self.final_norm = dev(self.final_norm)
+            for layer in self.layers:
+                for name in ("input_norm", "post_norm", "q_norm", "k_norm"):
+                    setattr(layer, name, dev(getattr(layer, name)))
 
     def _mlp(self, base):
-        return (_Linear(self.store, base + ".gate_proj", self.dtype, self.ternary_backend),
-                _Linear(self.store, base + ".up_proj", self.dtype, self.ternary_backend),
-                _Linear(self.store, base + ".down_proj", self.dtype, self.ternary_backend))
+        return (_Linear(self.store, base + ".gate_proj", self.dtype, self.ternary_backend, self.device),
+                _Linear(self.store, base + ".up_proj", self.dtype, self.ternary_backend, self.device),
+                _Linear(self.store, base + ".down_proj", self.dtype, self.ternary_backend, self.device))
 
     def _norm(self, x, weight):
         xf = x.float()
@@ -155,8 +180,9 @@ class StandardDecoder:
                 capture_routing: list | None = None):
         """ids [batch, seq] continuing ``past``. ``capture_routing`` (MoE only) receives one entry
         per layer: the selected experts [batch * seq, top_k] for this step's tokens."""
-        if ids.ndim != 2 or ids.device.type != "cpu" or ids.shape[1] == 0:
-            raise ValueError("input IDs must be a nonempty CPU [batch, sequence] tensor")
+        if ids.ndim != 2 or ids.shape[1] == 0:
+            raise ValueError("input IDs must be a nonempty [batch, sequence] tensor")
+        ids = ids.to(self.device) if self.device is not None else ids.cpu()
         past = [None] * len(self.layers) if past is None else past
         if len(past) != len(self.layers):
             raise ValueError("KV cache layer count differs from the model")
@@ -214,10 +240,11 @@ class StandardEngine:
     @classmethod
     def load(cls, path: str | Path, *, dtype: torch.dtype = torch.float32, max_seq_len=4096,
              mode_b_cache_bytes: int = 256 << 20, tokenizer_path=None, max_seqs=8, max_tokens=16384,
-             ternary_backend: str = "auto", expert_cache_bytes: int | None = None):
+             ternary_backend: str = "auto", expert_cache_bytes: int | None = None, device=None):
         from .engine import load_tokenizer
         return cls(StandardDecoder(path, dtype=dtype, mode_b_cache_bytes=mode_b_cache_bytes,
-                                   ternary_backend=ternary_backend, expert_cache_bytes=expert_cache_bytes),
+                                   ternary_backend=ternary_backend, expert_cache_bytes=expert_cache_bytes,
+                                   device=device),
                    load_tokenizer(tokenizer_path or path), max_seq_len=max_seq_len,
                    max_seqs=max_seqs, max_tokens=max_tokens)
 
@@ -235,9 +262,17 @@ class StandardEngine:
             all_logits.append(logits)
             for acc, state in zip(all_states, states):
                 acc.append(state)
-        return ReferenceTrace(input_ids, [torch.cat(s, dim=1) for s in all_states], torch.cat(all_logits, dim=1),
+        return ReferenceTrace(input_ids, [torch.cat(s, dim=1).cpu() for s in all_states], torch.cat(all_logits, dim=1).cpu(),
                               {"backend": "boilerplate-standard", "decode_from": decode_from,
                                "hidden_semantics": "transformers hidden_states"})
+
+    def routing(self, input_ids: list[int]) -> list[torch.Tensor]:
+        """Experts chosen in every MoE layer for each token of one prefill ([tokens, top_k] each)."""
+        if "num_experts" not in self.model.config:
+            raise ValueError("routing drift needs an MoE model")
+        out: list = []
+        self.model.forward(torch.tensor([list(input_ids)], dtype=torch.long), capture_routing=out)
+        return [r.cpu() for r in out]
 
     def generate(self, prompts, max_new_tokens=32, temperature=0.0, seed=None, eos_token_ids=None, stream=None):
         from .engine import GenerationResult, sample
@@ -260,7 +295,7 @@ class StandardEngine:
             logits, _, past = self.model.forward(torch.tensor([prompts[i] for i in rows], dtype=torch.long))
             active = list(range(len(rows)))
             for step in range(max_new_tokens):
-                chosen = sample(logits[:, -1], temperature, generator).tolist()
+                chosen = sample(logits[:, -1].cpu(), temperature, generator).tolist()  # CPU RNG on any device
                 for r in list(active):
                     index, token = rows[r], int(chosen[r])
                     results[index].append(token)

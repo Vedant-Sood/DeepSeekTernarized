@@ -494,7 +494,8 @@ def main(a) -> int:
         raise SystemExit(f"refusing to serve on {a.host} without an API key: pass --api-key or set "
                          "BOILERPLATE_API_KEY (or --insecure-no-auth on a trusted, isolated network)")
     torch.set_num_threads(a.threads)
-    server = Server.load(a.checkpoint, name=a.name, max_seq_len=a.max_seq_len,
+    extra = {"device": a.device} if getattr(a, "device", None) else {}
+    server = Server.load(a.checkpoint, name=a.name, max_seq_len=a.max_seq_len, **extra,
                          mode_b_cache_bytes=a.mode_b_cache_mib << 20,
                          expert_cache_bytes=None if a.expert_cache_mib is None else a.expert_cache_mib << 20)
     server.default_max_tokens = a.default_max_tokens

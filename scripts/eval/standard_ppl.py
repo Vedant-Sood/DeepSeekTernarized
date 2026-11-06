@@ -27,9 +27,10 @@ def main(argv=None) -> int:
     p.add_argument("--ctx", type=int, default=2048)
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--max-windows", type=int, help="score only the first N windows (reported)")
-    p.add_argument("--ternary-backend", default="torch", choices=("torch", "auto"),
+    p.add_argument("--ternary-backend", default="torch", choices=("torch", "auto", "cuda"),
                    help="torch: int8 activations x cached FP32 dequantized trits (BLAS); auto: C++ kernel")
     p.add_argument("--out", type=Path, help="also write the JSON result here")
+    p.add_argument("--device", help="Llama/OLMoE: run on this device (e.g. cuda)")
     a = p.parse_args(argv)
     os.environ.update(OMP_NUM_THREADS=str(a.threads), MKL_NUM_THREADS=str(a.threads), MKL_DYNAMIC="FALSE")
 
@@ -45,7 +46,7 @@ def main(argv=None) -> int:
     model_type = json.loads((a.checkpoint / "config.json").read_text()).get("model_type")
     if model_type in ("llama", "olmoe"):
         engine = StandardEngine.load(a.checkpoint, dtype=torch.float32, max_seq_len=a.ctx,
-                                     ternary_backend=a.ternary_backend)
+                                     ternary_backend=a.ternary_backend, device=a.device)
         def window_logits(chunk):
             return engine.model.forward(chunk)[0]
     else:  # DeepSeek V4.1 (any mode) through the main engine

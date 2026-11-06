@@ -17,7 +17,8 @@ master_dtype: bf16
 optimizer: adamw
 gradient_checkpointing: true
 freeze_router: true
-teacher_dir: work/qat/olmoe_teacher_top32    # offline BF16 teacher top-k (boilerplate qat-teacher)
+teacher_model: work/models/olmoe-1b-7b-0125-bf16           # online BF16 teacher (top-32 KL); offline: teacher_dir from qat-teacher
+teacher_k: 32
 kl_weight: 0.5
 packing: tq1
 log_every: 10

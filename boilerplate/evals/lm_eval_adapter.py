@@ -161,7 +161,8 @@ def main(a) -> int:
     import lm_eval
 
     torch.set_num_threads(a.threads)
-    lm = _lm_class()(path=a.checkpoint, max_seq_len=a.max_seq_len, mode_b_cache_bytes=a.mode_b_cache_mib << 20)
+    extra = {"device": a.device} if a.device else {}
+    lm = _lm_class()(path=a.checkpoint, max_seq_len=a.max_seq_len, mode_b_cache_bytes=a.mode_b_cache_mib << 20, **extra)
     results = lm_eval.simple_evaluate(model=lm, tasks=a.tasks.split(","), num_fewshot=a.num_fewshot,
                                       limit=a.limit, random_seed=a.seed, numpy_random_seed=a.seed,
                                       torch_random_seed=a.seed)

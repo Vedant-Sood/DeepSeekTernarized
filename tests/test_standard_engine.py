@@ -228,3 +228,32 @@ def test_olmoe_expert_cache_budget_keeps_outputs(tmp_path):
     b = eng.trace(ids, decode_from=4)
     assert torch.equal(a.logits, b.logits)
     assert eng.model.expert_cache.stats()["host_experts"] == 0
+
+
+@pytest.mark.parametrize("kind", ["llama", "olmoe"])
+@pytest.mark.parametrize("policy", [None, "absmean"])
+def test_materialized_device_path_matches_mmap_path(tmp_path, kind, policy):
+    """device= keeps every weight resident (the GPU path); on CPU it must equal the mmap path."""
+    _make_model(tmp_path / "src", kind)
+    path = tmp_path / "src"
+    if policy:
+        pol = Policy("d", [Rule(match=r"mlp\.(experts\.\d+\.)?(gate|up|down)_proj$", mode="D", group=8,
+                                packing="tq2", scale_dtype="fp16", act="int8")])
+        path = export(path, tmp_path / "exp", pol, log=lambda *_: None)
+    ids = torch.tensor([[3, 8, 2, 17, 12, 5]])
+    a = StandardEngine.load(path, ternary_backend="torch").trace(ids, decode_from=4)
+    eng = StandardEngine.load(path, ternary_backend="torch", device="cpu")
+    b = eng.trace(ids, decode_from=4)
+    assert torch.allclose(a.logits, b.logits, atol=1e-5, rtol=1e-5)
+    assert eng.generate([[3, 8, 2]], max_new_tokens=4).tokens == \
+        StandardEngine.load(path, ternary_backend="torch").generate([[3, 8, 2]], max_new_tokens=4).tokens
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU unavailable")
+@pytest.mark.parametrize("kind", ["llama", "olmoe"])
+def test_cuda_device_path_matches_cpu(tmp_path, kind):
+    _make_model(tmp_path, kind)
+    ids = torch.tensor([[3, 8, 2, 17, 12, 5]])
+    a = StandardEngine.load(tmp_path).trace(ids, decode_from=4)
+    b = StandardEngine.load(tmp_path, device="cuda").trace(ids, decode_from=4)
+    assert torch.allclose(a.logits, b.logits, atol=1e-3, rtol=1e-3)
