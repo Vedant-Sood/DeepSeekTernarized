@@ -21,13 +21,7 @@ case "${1:-}" in
       --train-chars 2.2e9 --heldout-chars 2e7
     boilerplate qat-tokenize "$CORPUS/train.jsonl" "$MODEL/tokenizer.json" "$DATA/fineweb_edu_smollm2.bin"
     boilerplate qat-tokenize "$CORPUS/heldout.jsonl" "$MODEL/tokenizer.json" "$DATA/fineweb_edu_smollm2_heldout.bin"
-    # WikiText-2 test text for the llama.cpp-protocol perplexity (rows joined with blank lines)
-    [ -f "$DATA/wikitext2_test.txt" ] || python - "$DATA/wikitext2_test.txt" <<'PY'
-import sys, pyarrow.parquet as pq
-from huggingface_hub import hf_hub_download
-f = hf_hub_download("Salesforce/wikitext", "wikitext-2-raw-v1/test-00000-of-00001.parquet", repo_type="dataset")
-open(sys.argv[1], "w", encoding="utf-8").write("\n".join(pq.read_table(f).column("text").to_pylist()))
-PY
+    [ -f "$DATA/wikitext2_test.txt" ] || python scripts/eval/get_wikitext2.py "$DATA"
     boilerplate qat-estimate "$CFG" --gpu rtx4060-laptop
     ;;
   probe)
@@ -48,9 +42,9 @@ PY
     [ -f "$CORPUS/heldout.txt" ] || python -c "import json,sys; open(sys.argv[2],'w').write('\n\n'.join(json.loads(l)['text'] for l in open(sys.argv[1])))" "$CORPUS/heldout.jsonl" "$CORPUS/heldout.txt"
     OUT=$(python -c "import yaml;print(yaml.safe_load(open('$CFG'))['out_dir'])")
     for d in "$OUT"/mode_d_*; do
-      python scripts/eval/standard_ppl.py "$d" "$DATA/wikitext2_test.txt" --out "$d/ppl_wikitext2.json"
-      python scripts/eval/standard_ppl.py "$d" "$CORPUS/heldout.txt" --out "$d/ppl_heldout.json"
-      boilerplate lm-eval "$d" --tasks mmlu,arc_challenge,hellaswag,piqa,winogrande,gsm8k --out "$d/lm_eval.json" --max-seq-len 2048
+      python scripts/eval/standard_ppl.py "$d" "$DATA/wikitext2_test.txt" --device cuda --out "$d/ppl_wikitext2.json"
+      python scripts/eval/standard_ppl.py "$d" "$CORPUS/heldout.txt" --device cuda --out "$d/ppl_heldout.json"
+      boilerplate lm-eval "$d" --device cuda --tasks mmlu,arc_challenge,hellaswag,piqa,winogrande,gsm8k --out "$d/lm_eval.json" --max-seq-len 2048
     done
     ;;
   *) sed -n 2,10p "$0"; exit 2 ;;

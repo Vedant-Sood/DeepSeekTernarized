@@ -27,11 +27,22 @@ class Experts(nn.ModuleList):
     so each projection can become a BitLinear and be exported/sharded on its own."""
 
     def forward(self, hidden, top_k_index, top_k_weights):
+        # One sort groups the (token, slot) pairs by expert; one host sync reads the group sizes.
+        # Each expert then sees a contiguous slice instead of a full-size torch.where scan.
+        k = top_k_index.shape[-1]
+        flat = top_k_index.reshape(-1)
+        order = torch.argsort(flat, stable=True)
+        counts = torch.bincount(flat, minlength=len(self)).tolist()
+        token = order // k
+        weight = top_k_weights.reshape(-1)[order].to(hidden.dtype)
+        inputs = hidden[token]
         out = torch.zeros_like(hidden)
-        for e, expert in enumerate(self):
-            token, slot = torch.where(top_k_index == e)
-            if token.numel():
-                out.index_add_(0, token, expert(hidden[token]) * top_k_weights[token, slot, None].to(hidden.dtype))
+        start = 0
+        for e, n in enumerate(counts):
+            if n:
+                end = start + n
+                out.index_add_(0, token[start:end], self[e](inputs[start:end]) * weight[start:end, None])
+                start = end
         return out
 
 

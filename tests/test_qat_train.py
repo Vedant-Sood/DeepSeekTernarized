@@ -240,3 +240,25 @@ def test_online_teacher_matches_offline(tmp_path):
     bad = _cfg(tmp_path, "llama", out_dir=str(tmp_path / "bad"), teacher_dir=off.teacher_dir, seq_len=8)
     with pytest.raises(SystemExit, match="teacher"):
         train(bad, log=lambda *_: None)
+
+
+def test_sorted_expert_dispatch_matches_per_expert_scan():
+    from boilerplate.qat.model import Expert, Experts
+
+    torch.manual_seed(0)
+    E, H, inter, T, k = 8, 32, 16, 50, 2
+    experts = Experts([Expert(H, inter) for _ in range(E)])
+    h = torch.randn(T, H, requires_grad=True)
+    idx = torch.stack([torch.randperm(E)[:k] for _ in range(T)])
+    idx[idx == 7] = 6  # one expert unused
+    w = torch.rand(T, k)
+    ref = torch.zeros_like(h)
+    for e, expert in enumerate(experts):
+        token, slot = torch.where(idx == e)
+        if token.numel():
+            ref = ref.index_add(0, token, expert(h[token]) * w[token, slot, None])
+    out = experts(h, idx, w)
+    assert torch.allclose(out, ref, atol=1e-6)
+    g1, = torch.autograd.grad(out.sum(), h)
+    g2, = torch.autograd.grad(ref.sum(), h)
+    assert torch.allclose(g1, g2, atol=1e-6)

@@ -266,6 +266,14 @@ class StandardEngine:
                               {"backend": "boilerplate-standard", "decode_from": decode_from,
                                "hidden_semantics": "transformers hidden_states"})
 
+    def routing(self, input_ids: list[int]) -> list[torch.Tensor]:
+        """Experts chosen in every MoE layer for each token of one prefill ([tokens, top_k] each)."""
+        if "num_experts" not in self.model.config:
+            raise ValueError("routing drift needs an MoE model")
+        out: list = []
+        self.model.forward(torch.tensor([list(input_ids)], dtype=torch.long), capture_routing=out)
+        return [r.cpu() for r in out]
+
     def generate(self, prompts, max_new_tokens=32, temperature=0.0, seed=None, eos_token_ids=None, stream=None):
         from .engine import GenerationResult, sample
         if (max_new_tokens < 0 or len(prompts) > self.max_seqs or

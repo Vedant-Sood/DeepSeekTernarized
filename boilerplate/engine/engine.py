@@ -112,6 +112,18 @@ class Engine:
             meta={"backend": "boilerplate", "mode": "A", "decode_from": decode_from, "hidden_semantics": "output of each Block: full hyper-connection stream [b, s, hc_mult, dim]"},
         )
 
+    def routing(self, input_ids: list[int]) -> list[torch.Tensor]:
+        """Experts chosen in every MoE layer for each token of one prefill ([tokens, top_k] each)."""
+        cache = self.new_cache()
+        seq = cache.new_sequence()
+        self.model.routing_capture = []
+        try:
+            self.model.forward([(seq, list(input_ids))], cache)
+            return self.model.routing_capture
+        finally:
+            self.model.routing_capture = None
+            cache.free(seq)
+
     # ------------------------------------------------------------------ generation
     def generate(
         self,
