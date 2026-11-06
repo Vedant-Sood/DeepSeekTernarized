@@ -1,6 +1,7 @@
 """Resume a tiny random model without training any pretrained checkpoint."""
 
 import random
+import pickle
 
 import numpy as np
 import pytest
@@ -8,6 +9,29 @@ import torch
 
 from boilerplate.qat import BitLinear
 from boilerplate.qat.checkpoint import load_checkpoint, save_checkpoint
+
+
+def test_checkpoint_pickle_globals_are_never_executed(tmp_path):
+    marker = tmp_path / "executed"
+    class Payload:
+        def __reduce__(self):
+            return (eval, (f"__import__('pathlib').Path({str(marker)!r}).touch()",))
+    path = tmp_path / "untrusted.pt"
+    torch.save({"payload": Payload()}, path)
+    model = BitLinear(7, 4)
+    optimizer = torch.optim.AdamW(model.parameters())
+    with pytest.raises(pickle.UnpicklingError):
+        load_checkpoint(path, model, optimizer)
+    assert not marker.exists()
+
+
+def test_new_checkpoints_are_weights_only_readable(tmp_path):
+    model = BitLinear(7, 4)
+    optimizer = torch.optim.AdamW(model.parameters())
+    path = save_checkpoint(tmp_path / "checkpoint.pt", model, optimizer, step=0, tokens_seen=0)
+    state = torch.load(path, weights_only=True)
+    assert state["version"] == 2
+    assert state["numpy_rng"][1].dtype == torch.int64
 
 
 def _step(model, optimizer, generator):
