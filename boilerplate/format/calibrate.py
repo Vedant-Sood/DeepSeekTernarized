@@ -22,8 +22,15 @@ def _input_key(base: str) -> str:
     return re.sub(r"\.w3$", ".w1", base)
 
 
-def calibrate(engine, sequences: list[list[int]], policy: Policy, layers: set[int] | None = None, log=print) -> dict[str, torch.Tensor]:
-    """{weight base: H / tokens} for every base whose rule asks for GPTQ (optionally only in ``layers``)."""
+def calibrate(engine, sequences: list[list[int]], policy: Policy, layers: set[int] | None = None, log=print,
+              min_tokens: int = 1) -> dict[str, torch.Tensor]:
+    """{weight base: H / tokens} for every base whose rule asks for GPTQ (optionally only in ``layers``).
+    Bases that saw fewer than ``min_tokens`` calibration tokens are left out; the exporter then
+    uses the plain fit for them and records ``gptq_fallback`` in the manifest."""
+    from ..engine.standard import StandardEngine
+
+    if isinstance(engine, StandardEngine):
+        return calibrate_standard(engine, sequences, policy, layers, log, min_tokens)
     ws = engine.model.w
     want = []
     for n in ws.names():
@@ -59,6 +66,49 @@ def calibrate(engine, sequences: list[list[int]], policy: Policy, layers: set[in
     out = {}
     for b in want:
         H, n = acc[_input_key(b)]
-        if n:  # an expert no calibration token routed to gets no H (exported without GPTQ)
+        if n >= max(min_tokens, 1):  # experts with too few routed tokens get no H (plain fit)
+            out[b] = H / n
+    return out
+
+
+def _standard_input_key(base: str) -> str:
+    """q/k/v share the attention input; gate/up share the MLP (or expert) input."""
+    return re.sub(r"\.(k_proj|v_proj)$", ".q_proj", re.sub(r"\.up_proj$", ".gate_proj", base))
+
+
+def calibrate_standard(engine, sequences: list[list[int]], policy: Policy, layers: set[int] | None = None,
+                       log=print, min_tokens: int = 1) -> dict[str, torch.Tensor]:
+    """GPTQ Hessians for a Llama/OLMoE checkpoint run by the standard-decoder engine."""
+    ws = engine.model.store
+    want = []
+    for n in ws.names():
+        if not n.endswith(".weight"):
+            continue
+        b = n[: -len(".weight")]
+        r = policy.rule_for(b)
+        if r.mode != "C" or not r.gptq or ws.get(n).ndim != 2:
+            continue
+        m = re.search(r"layers\.(\d+)\.", b)
+        if layers is not None and (m is None or int(m.group(1)) not in layers):
+            continue
+        want.append(b)
+    acc: dict[str, list] = {}
+    for b in want:
+        key = _standard_input_key(b)
+        if key not in acc:
+            K = ws.get(f"{b}.weight").shape[1]
+            acc[key] = [torch.zeros(K, K), 0]
+    log(f"calibrating {len(want)} weights ({len(acc)} distinct inputs, {sum(a[0].numel() for a in acc.values()) * 4 / 2**30:.2f} GiB of H)")
+    M.CALIB = acc
+    try:
+        for i, ids in enumerate(sequences):
+            engine.model.forward(torch.tensor([ids], dtype=torch.long))
+            log(f"  sequence {i + 1}/{len(sequences)}")
+    finally:
+        M.CALIB = None
+    out = {}
+    for b in want:
+        H, n = acc[_standard_input_key(b)]
+        if n >= max(min_tokens, 1):
             out[b] = H / n
     return out

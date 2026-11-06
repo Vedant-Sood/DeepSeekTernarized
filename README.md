@@ -9,11 +9,15 @@ use ~1.6–2 bits/weight.
 Status: **M0** (skeleton, config parser, reference harness), **M1** (Mode A engine, bit-exact
 with the official reference) and **M2** (TQ1/TQ2 packing, CPU ternary kernel, Mode C with optional
 GPTQ) are implemented. **M3** has CPU Mode B and an on-demand decoded weight cache, validated
-against Mode A on tiny and the seven-layer real slice. A CUDA decoder prototype is present but
-has not been compiled or run on a GPU; GPU engine integration and measurements remain open.
-**M4** has a CPU standard-decoder correctness path and initial QAT primitives. The SmolLM2
-Mode A comparison passed against Hugging Face; OLMoE's pretrained comparison and training are
-still pending. See `docs/reports/`,
+against Mode A on tiny and the seven-layer real slice. **M4** and **M5** are code complete for
+everything that does not need approved hardware: the standard decoder (Llama/OLMoE), the QAT
+trainer with FSDP2, offline distillation, exact resume and Mode D / GGUF export, the compute
+estimator and launch scripts, a resumable streaming converter, a tiered expert cache, an
+OpenAI-compatible server and an lm-eval-harness adapter. **Not run yet:** any QAT on a
+pretrained model, anything on a GPU (the CUDA Huffman and ternary kernels have not been compiled
+or run), and every full-model conversion and evaluation. Those are gated on Vedant's approval of
+hardware and budget. The pre-registered M4 verdict is untested. See `docs/reports/`
+(`small_model_ternary.md` is M4, `M5.md` lists what is built, not built and not run),
 `docs/architecture/format.md` for the on-disk format,
 `docs/architecture/deepseek_v41_flash.md` for what the checkpoint contains and
 `docs/architecture/engine.md` for the engine design.
@@ -29,13 +33,15 @@ still pending. See `docs/reports/`,
   Decoded tensors and table blocks use an LRU with a configurable byte budget; transient decoding
   and process RSS are not limited by that budget.
 * **Mode C** exports and runs stacked ternary weights with TQ1/TQ2 packing, CPU kernels and
-  optional GPTQ. A mixed Mode B + C policy is available. Mode D has QAT primitives but no
-  complete training or model-export pipeline yet.
+  optional GPTQ. A mixed Mode B + C policy is available.
+* **Mode D** (one ternary term from QAT) trains and exports for Llama/OLMoE-family Hugging Face
+  models (`boilerplate qat-train`). The export loads in the engine, and its outputs match the
+  training graph. Mode D for DeepSeek V4.1 itself is not built (see `docs/reports/M5.md`).
 
 ## Weight modes
 
 **A** baseline (original FP8/FP4), **B** lossless entropy-coded, **C** stacked residual ternary,
-**D** QAT-trained single ternary (planned). Packing: TQ2 (2 bits/weight) and TQ1 (5 trits/byte, 1.6
+**D** QAT-trained single ternary. Packing: TQ2 (2 bits/weight) and TQ1 (5 trits/byte, 1.6
 bits/weight), each plus an FP16 scale per 128 weights (1.725 / 2.125 bits/weight).
 
 What ternary can save here is limited by the source: the routed experts are already FP4 (4.25
@@ -83,6 +89,23 @@ boilerplate export ./trunc7 ./trunc7_gptq --policy my_gptq.yaml --calib-text wik
 boilerplate generate ./trunc7 "The capital of France is" --max-new-tokens 16
 ```
 
+```bash
+# Serve over HTTP (OpenAI-compatible; "stream": true for server-sent events)
+boilerplate serve ./trunc7 --port 8000
+curl localhost:8000/v1/chat/completions -d '{"messages":[{"role":"user","content":"Hi"}],"max_tokens":32}'
+
+# lm-evaluation-harness tasks in process (pip install -e ".[eval]")
+boilerplate lm-eval ./trunc7 --tasks hellaswag,arc_easy --limit 100 --out results/lmeval.json
+
+# Ternary QAT of a small HF model (runs over 20 steps need `approval:` in the config)
+boilerplate qat-estimate configs/qat/smollm2_shakedown.yaml --gpu rtx4060-laptop
+boilerplate qat-train configs/qat/smollm2_shakedown.yaml --max-steps 20
+boilerplate gguf ./mode_d_export ./model-tq1.gguf    # llama.cpp TQ1_0 / TQ2_0 of the same weights
+```
+
+Launch scripts for the gated runs are in `scripts/launch/`: the SmolLM2 shakedown, OLMoE QAT and
+M5's full conversion and evals. Each one stops at its approval gate.
+
 Python API:
 
 ```python
@@ -95,6 +118,8 @@ For Mode B, `Engine.load(path, mode_b_cache_bytes=256 << 20)` sets the decoded-b
 zero disables retention. The `trace`, `generate` and `bench` commands also accept
 `--mode-b-cache-mib` (default 256). Temporary decode buffers, other caches and mmap pages are
 outside this limit.
+`expert_cache_bytes` (`--expert-cache-mib` on `bench` and `serve`) bounds how many routed experts
+stay materialized. Hit rates are in the `bench` output and at the server's `/stats`.
 
 Checkpoint index paths and their resolved symlinks must stay inside the checkpoint directory.
 If a Hub cache snapshot links to files elsewhere, copy the files into a standalone directory first.
@@ -108,15 +133,18 @@ boundaries and remaining limitations.
 boilerplate/
   checkpoint/   config/index/header reading, FP8/FP4 block formats
   config/       ModelSpec derivation, tensor roles, size report
-  engine/       engine: config, mmap weights (Modes A/B/C), model, paged KV cache, engram, API
+  engine/       engine: config, mmap weights (Modes A-D), V4 model, standard decoder, paged KV, engram, expert cache, API
+  evals/        lm-evaluation-harness adapter
   format/       precision policies, export + manifest, Mode B entropy codec, GPTQ calibration
-  kernels/      torch_ref (official kernels' numerics) and the C++ CPU extension (ternary GEMM, Huffman)
-  qat/          BitLinear, local checkpoint/resume and top-k distillation primitives
+  kernels/      torch_ref (official numerics), C++ CPU extension (ternary GEMM, Huffman), CUDA Huffman + ternary/grouped GEMM
+  qat/          BitLinear, trainer, FSDP2, data, offline teacher, routing drift, checkpoints, Mode D export, estimates
   ternary/      TQ1/TQ2 packing, stacked-ternary and GPTQ fitting, ternary linear
   reference/    traces, comparison, official + HF backends
   testing/      tiny checkpoint writer, truncated real-checkpoint slicer
 third_party/    official DeepSeek V4.1 inference code (MIT), the trusted reference
-configs/        source checkpoint id, precision policies (configs/policy/)
+  serve.py      OpenAI-compatible HTTP server
+configs/        source checkpoint id, precision policies (configs/policy/), QAT run configs (configs/qat/)
+scripts/        evaluation scripts (scripts/eval/), gated launch scripts (scripts/launch/)
 docs/           architecture notes and milestone reports
 tests/
 ```

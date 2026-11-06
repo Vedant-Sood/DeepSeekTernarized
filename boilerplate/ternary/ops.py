@@ -2,7 +2,8 @@
 
 Activations into a ternary layer are quantized to int8 per token with an absmax scale (default),
 or kept in floating point (``act="bf16"``). The product then runs on the C++ kernel (add/subtract
-inner loop) or, without it, on a PyTorch reference that dequantizes the weight.
+inner loop), on CUDA inputs the CUDA kernel (``kernels/ternary_cuda.py``), or, without either, on a
+PyTorch reference that dequantizes the weight.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from dataclasses import dataclass
 import torch
 
 from ..kernels.cpu import ext
+from ..kernels.ternary_cuda import ext as _cuda_ternary
 from .pack import _TQ1_LUT, unpack
 
 
@@ -36,6 +38,12 @@ class TernaryLinear:
         self.backend = backend
         self._deq = None
 
+    def _on(self, device) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """(packed, f32 scale) per term on ``device``, copied once and kept."""
+        if getattr(self, "_dev", None) is None or self._dev[0] != device:
+            self._dev = (device, [(t.packed.to(device), sc.to(device)) for t, sc in zip(self.terms, self.scales_f32)])
+        return self._dev[1]
+
     @property
     def out_features(self) -> int:
         return self.terms[0].packed.size(0)
@@ -57,12 +65,19 @@ class TernaryLinear:
         else:
             q, s = x2.float().contiguous(), torch.ones(x2.size(0))
         e = ext() if self.backend in ("auto", "cpp") else None
-        if e is not None and x2.device.type == "cpu":
+        if x2.is_cuda and self.act == "int8" and self.backend in ("auto", "cuda") and _cuda_ternary() is not None:
+            from ..kernels.ternary_cuda import ternary_gemm
+
+            out = None
+            for t, sc in self._on(x2.device):
+                y = ternary_gemm(q, s, t, sc, self.K, self.group, self.fmt, backend="cuda")
+                out = y if out is None else out + y
+        elif e is not None and x2.device.type == "cpu":
             out = torch.zeros(x2.size(0), self.out_features, dtype=torch.float32)
             fmt = 2 if self.fmt == "tq2" else 1
             for t, sc in zip(self.terms, self.scales_f32):
                 e.ternary_gemm(out, q.contiguous(), s.float().contiguous(), t.packed.contiguous(), sc, self.K, self.group, fmt, _TQ1_LUT)
         else:
             xa = q.float() * s.unsqueeze(-1) if self.act == "int8" else q
-            out = xa @ self.dequantized().t()
+            out = xa @ self.dequantized().to(xa.device).t()
         return out.view(*shape[:-1], -1).to(out_dtype)

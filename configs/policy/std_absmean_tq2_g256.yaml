@@ -1,0 +1,15 @@
+# M4: absmean ternary with one FP16 scale per 256 weights, the block layout of llama.cpp TQ2_0,
+# so `boilerplate gguf` can convert these tensors exactly. Tensors whose input dimension is not a
+# multiple of 256 still export here (group 256 with a short last group) but cannot go to GGUF TQ.
+name: std_absmean_tq2_g256
+default: {mode: A}
+rules:
+  - match: '^model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj|mlp\.experts\.\d+\.(gate|up|down)_proj)$'
+    mode: C
+    k: 1
+    group: 256
+    packing: tq2
+    scale_dtype: fp16
+    act: int8
+    gptq: false
+    fit: absmean

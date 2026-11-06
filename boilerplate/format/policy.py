@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-MODES = ("A", "B", "C")
+MODES = ("A", "B", "C", "D")  # D: QAT-trained single ternary term (exported with the absmean quantizer)
 MAX_RATIO = 0.85
 
 
@@ -27,7 +27,8 @@ class Rule:
     scale_dtype: str = "fp16"
     act: str = "int8"
     gptq: bool = False
-    quantizer: str = "residual"  # optimal residual fit, or single-term absmean
+    fit: str | None = None  # backward-compatible alias for the quantizer choice
+    quantizer: str | None = None  # "residual" (default) or single-term "absmean"
     allow_larger: bool = False  # permit Mode C settings that do not shrink the source (experiments)
 
     def effective_bits(self, columns: int | None = None) -> float:
@@ -45,7 +46,20 @@ class Rule:
         self.regex = re.compile(self.match)
         if self.mode not in MODES:
             raise ValueError(f"mode {self.mode!r}: expected one of {MODES}")
-        if self.mode == "C":
+        if self.mode == "D":
+            # Mode D stores what QAT trained against: one absmean term, no GPTQ.
+            self.k, self.fit, self.quantizer, self.gptq = 1, "absmean", "absmean", False
+        if self.quantizer is None and self.fit is None:
+            self.quantizer, self.fit = "residual", "lsq"
+        elif self.quantizer is None:
+            if self.fit not in ("lsq", "absmean"):
+                raise ValueError(f"fit {self.fit!r}: expected lsq or absmean")
+            self.quantizer = "absmean" if self.fit == "absmean" else "residual"
+        elif self.fit is None:
+            if self.quantizer not in ("residual", "absmean"):
+                raise ValueError("quantizer must be residual or single-term absmean")
+            self.fit = "absmean" if self.quantizer == "absmean" else "lsq"
+        if self.mode in ("C", "D"):
             if not 1 <= self.k <= 4:
                 raise ValueError("k must be 1..4")
             if self.group <= 0:
@@ -58,6 +72,10 @@ class Rule:
                 raise ValueError(f"scale_dtype {self.scale_dtype!r}")
             if self.act not in ("int8", "bf16"):
                 raise ValueError(f"act {self.act!r}")
+            if self.fit not in ("lsq", "absmean"):
+                raise ValueError(f"fit {self.fit!r}: expected lsq or absmean")
+            if (self.fit == "absmean") != (self.quantizer == "absmean"):
+                raise ValueError("fit and quantizer must agree (lsq/residual or absmean/absmean)")
 
 
 @dataclass
@@ -82,7 +100,8 @@ class Policy:
         return cls.from_dict(yaml.safe_load(Path(path).read_text()))
 
     def to_dict(self) -> dict:
-        keep = ("match", "mode", "k", "group", "packing", "scale_dtype", "act", "gptq", "quantizer", "allow_larger")
+        keep = ("match", "mode", "k", "group", "packing", "scale_dtype", "act", "gptq",
+                "fit", "quantizer", "allow_larger")
         return {
             "name": self.name,
             "default": {k: getattr(self.default, k) for k in keep if k != "match"},

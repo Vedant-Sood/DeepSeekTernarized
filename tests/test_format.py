@@ -229,3 +229,39 @@ def test_mode_c_export_and_run(tiny, ids, mode_a, tmp_path, engram):
     R = sum(unpack(ws.get(f"{ex}.tq{i}.packed"), "tq1", K).float() * ws.get(f"{ex}.tq{i}.scale").float().repeat_interleave(128, -1)[:, :K]
             for i in range(2))
     assert ((W - R).norm() / W.norm()) < 0.3
+
+
+@needs_ext
+def test_export_resumes_after_interruption(tiny, tmp_path, monkeypatch):
+    import boilerplate.format.export as ex
+
+    policy = Policy.from_dict({"name": "mixed", "default": {"mode": "B"},
+                               "rules": [{"match": EXPERTS, "mode": "C", "k": 2, "packing": "tq1"}]})
+    clean = export(tiny, tmp_path / "clean", policy, shard_bytes=1 << 16, log=lambda *a: None)
+    real, calls = ex.entropy.encode, {"n": 0}
+
+    def flaky(t, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 40:
+            raise KeyboardInterrupt("simulated interruption")
+        return real(t, *a, **k)
+
+    monkeypatch.setattr(ex.entropy, "encode", flaky)
+    target = tmp_path / "resumed"
+    with pytest.raises(KeyboardInterrupt):
+        export(tiny, target, policy, shard_bytes=1 << 16, log=lambda *a: None)
+    journal = json.loads((target / ".export_journal.json").read_text())
+    assert journal["files"] and journal["tensors"]
+    monkeypatch.setattr(ex.entropy, "encode", real)
+    logs = []
+    export(tiny, target, policy, shard_bytes=1 << 16, log=logs.append)
+    assert any("resuming export" in m for m in logs)
+    assert not (target / ".export_journal.json").exists()
+    a = json.loads((clean / "manifest.json").read_text())
+    b = json.loads((target / "manifest.json").read_text())
+    strip = lambda m: {k: {**v, "stored": {n: {x: y for x, y in s.items() if x != "file"} for n, s in v["stored"].items()}}
+                       for k, v in m["tensors"].items()}
+    assert strip(a) == strip(b) and a["summary"] == b["summary"]
+    wa, wb = WeightStore(clean), WeightStore(target)
+    for name in wa.names():
+        assert torch.equal(wa.get(name).view(torch.uint8), wb.get(name).view(torch.uint8)), name
