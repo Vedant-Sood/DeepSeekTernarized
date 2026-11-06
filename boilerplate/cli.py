@@ -292,6 +292,12 @@ def _cmd_qat_train(a) -> int:
                       + (["--plan"] if a.plan else []))
 
 
+def _cmd_agent(a) -> int:
+    from .agent.cli import main as agent_main
+
+    return agent_main(args=a)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="boilerplate")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -460,6 +466,12 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--max-steps", type=int)
     s.add_argument("--plan", action="store_true", help="print steps/tokens and exit")
     s.set_defaults(fn=_cmd_qat_train)
+
+    s = sub.add_parser("agent", help="interactive coding agent on the engine or any OpenAI-compatible endpoint")
+    from .agent.cli import build_parser as _agent_parser
+
+    _agent_parser(s)
+    s.set_defaults(fn=_cmd_agent)
 
     a = p.parse_args(argv)
     return a.fn(a)
