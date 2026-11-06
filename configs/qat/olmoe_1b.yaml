@@ -1,0 +1,27 @@
+# OLMoE-1B-7B ternary QAT, 1 B tokens, FSDP2 on 4 x 80 GB GPUs. GATED: needs Vedant's approved
+# GPU budget in `approval:` (the trainer refuses runs over 20 steps without it).
+# Launch: scripts/launch/olmoe_qat.sh configs/qat/olmoe_1b.yaml
+source: work/models/olmoe-1b-7b-0125-bf16    # boilerplate cast <F32 download> <this> bf16
+train_tokens: work/data/olmoe_mix_train.bin  # boilerplate qat-tokenize (OLMoE tokenizer)
+out_dir: work/qat/olmoe_1b
+token_budget: 1000000000
+seq_len: 2048
+micro_batch: 4
+grad_accum: 4                                # x 4 GPUs = 131,072 tokens per optimizer step
+lr: 1.5e-4
+min_lr: 1.5e-5
+lr_warmup_steps: 200
+quant_warmup_steps: 1000
+group: 128
+master_dtype: bf16
+optimizer: adamw
+gradient_checkpointing: true
+freeze_router: true
+teacher_dir: work/qat/olmoe_teacher_top32    # offline BF16 teacher top-k (boilerplate qat-teacher)
+kl_weight: 0.5
+packing: tq1
+log_every: 10
+checkpoint_every: 500
+routing_every: 100
+device: cuda
+approval: null

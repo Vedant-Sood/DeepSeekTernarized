@@ -47,7 +47,7 @@ class BackendConfig:
     endpoint: str = "http://127.0.0.1:8000/v1"
     model: str = "boilerplate"
     api_key_env: str | None = None
-    tool_protocol: str = "native"  # native | text
+    tool_protocol: str = "auto"  # auto | native | text (auto: text for boilerplate serve, else native)
     allow_insecure_http: bool = False
     timeout: float = 300.0
     temperature: float = 0.2
@@ -112,8 +112,8 @@ class AgentConfig:
             raise ValueError(f"mode must be one of {MODES}, got {self.mode!r}")
         if self.backend.kind not in ("openai", "local", "mock"):
             raise ValueError(f"unknown backend kind {self.backend.kind!r}")
-        if self.backend.tool_protocol not in ("native", "text"):
-            raise ValueError("tool_protocol must be 'native' or 'text'")
+        if self.backend.tool_protocol not in ("auto", "native", "text"):
+            raise ValueError("tool_protocol must be 'auto', 'native' or 'text'")
         if not 0 < self.context.compact_at <= 1:
             raise ValueError("context.compact_at must be in (0, 1]")
         if self.shell.timeout <= 0 or self.shell.timeout > self.shell.max_timeout:

@@ -142,3 +142,89 @@ def test_engine_dispatch_and_cli_benchmark(tmp_path, capsys):
         assert output.with_suffix(".safetensors").is_file()
     finally:
         torch.set_num_threads(threads)
+
+
+def test_batched_generate_matches_one_prompt_at_a_time(tmp_path):
+    _make_model(tmp_path, "llama")
+    engine = StandardEngine.load(tmp_path)
+    prompts = [[3, 8, 2, 17], [5, 6, 7, 9], [11, 12, 13]]
+    batched = engine.generate(prompts, max_new_tokens=6, eos_token_ids=set()).tokens
+    single = [engine.generate([p], max_new_tokens=6, eos_token_ids=set()).tokens[0] for p in prompts]
+    assert batched == single
+    eos = single[0][1]
+    stopped = engine.generate(prompts, max_new_tokens=6, eos_token_ids={eos})
+    assert stopped.tokens[0] == single[0][:single[0].index(eos) + 1] and stopped.finished[0]
+
+
+def test_absmean_ptq_export_matches_qat_quantizer(tmp_path):
+    from boilerplate.ternary.fit import absmean_ternary
+    from boilerplate.ternary.pack import unpack
+
+    source, target = tmp_path / "source", tmp_path / "absmean"
+    _make_model(source, "llama")
+    with pytest.raises(ValueError, match="absmean"):
+        Rule(match=".", mode="C", k=2, fit="absmean")
+    policy = Policy("absmean", [Rule(match=r"layers\.\d+\.(self_attn|mlp)\.\w+_proj$", mode="C", k=1,
+                                     group=8, packing="tq1", fit="absmean")])
+    assert Policy.from_dict(policy.to_dict()).rules[0].fit == "absmean"
+    export(source, target, policy, log=lambda *_: None)
+    meta = json.loads((target / "manifest.json").read_text())["tensors"]
+    base = "model.layers.0.self_attn.q_proj"
+    assert meta[base]["fit"] == "absmean" and meta[base]["mode"] == "C"
+    w = WeightStore(source).get(base + ".weight")
+    term = absmean_ternary(w.float(), 8)
+    stored = WeightStore(target)
+    assert torch.equal(unpack(stored.get(base + ".tq0.packed"), "tq1", w.shape[1]), term.trits)
+    assert torch.equal(stored.get(base + ".tq0.scale"), term.scale)
+    logits = StandardEngine.load(target).trace(torch.tensor([[3, 8, 2, 17]])).logits
+    assert torch.isfinite(logits).all()
+
+
+def test_standard_gptq_calibration_export_and_fallback(tmp_path):
+    from boilerplate.format.calibrate import calibrate
+
+    source, target = tmp_path / "source", tmp_path / "gptq"
+    _make_model(source, "olmoe")
+    policy = Policy("gptq", [Rule(match=r"layers\.\d+\.(self_attn|mlp\.experts\.\d+)\.\w+_proj$", mode="C", k=1,
+                                  group=8, packing="tq1", gptq=True)])
+    engine = StandardEngine.load(source)
+    seqs = [list(range(3, 19)), list(range(20, 36))]
+    hessians = calibrate(engine, seqs, policy, log=lambda *_: None)
+    attn = "model.layers.0.self_attn"
+    assert torch.equal(hessians[attn + ".q_proj"], hessians[attn + ".v_proj"])  # shared input
+    assert hessians[attn + ".q_proj"].shape == (24, 24)
+    # an absurd minimum drops every Hessian: export falls back to the plain fit and says so
+    none = calibrate(engine, seqs, policy, min_tokens=10**6, log=lambda *_: None)
+    assert none == {}
+    export(source, target, policy, hessians=hessians, log=lambda *_: None)
+    meta = json.loads((target / "manifest.json").read_text())["tensors"]
+    assert meta[attn + ".q_proj"]["gptq"] is True
+    for base, entry in meta.items():
+        if entry.get("mode") == "C" and base not in hessians:
+            assert entry["gptq"] is False and entry["gptq_fallback"] == "too few calibration tokens"
+    fallback = tmp_path / "fallback"
+    export(source, fallback, policy, hessians={}, log=lambda *_: None)
+    assert all(e["gptq_fallback"] for e in json.loads((fallback / "manifest.json").read_text())["tensors"].values()
+               if e.get("mode") == "C")
+    assert torch.isfinite(StandardEngine.load(target).trace(torch.tensor([[3, 8, 2]])).logits).all()
+
+
+def test_standard_routing_capture(tmp_path):
+    from boilerplate.qat.routing import topk_overlap
+
+    _make_model(tmp_path, "olmoe")
+    engine = StandardEngine.load(tmp_path)
+    routing = []
+    engine.model.forward(torch.tensor([[3, 8, 2, 17]]), capture_routing=routing)
+    assert len(routing) == 2 and routing[0].shape == (4, 2)
+    assert topk_overlap(routing[0], routing[0]) == 1.0
+
+
+def test_olmoe_expert_cache_budget_keeps_outputs(tmp_path):
+    _make_model(tmp_path, "olmoe")
+    ids = torch.tensor([[3, 8, 2, 17, 12, 5]])
+    a = StandardEngine.load(tmp_path).trace(ids, decode_from=4)
+    eng = StandardEngine.load(tmp_path, expert_cache_bytes=0)
+    b = eng.trace(ids, decode_from=4)
+    assert torch.equal(a.logits, b.logits)
+    assert eng.model.expert_cache.stats()["host_experts"] == 0

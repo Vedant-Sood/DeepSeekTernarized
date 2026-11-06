@@ -39,7 +39,7 @@ boilerplate/agent/
   session.py      JSONL transcripts (0600), resume, token estimate, context compaction
   loop.py         the agent loop
   cli.py          REPL, slash commands, one-shot mode, approval prompts
-boilerplate/serve.py  minimal OpenAI-compatible HTTP server over Engine
+boilerplate/serve.py  the engine's OpenAI-compatible server (already on main; the agent is a client)
 ```
 
 Data flow for one user turn:
@@ -60,7 +60,10 @@ All backends implement `chat(messages, tools, on_text) -> AssistantTurn(text, to
 - **OpenAI-compatible HTTP** (`--endpoint URL --model NAME`). `POST {base}/chat/completions` with
   `stream: true`, parsing server-sent events and accumulating `delta.tool_calls` by index. Native
   tool calling is used when the server supports it; with `tool_protocol: text` the tool list is
-  put into the system prompt and calls are parsed from text instead. Uses only the standard
+  put into the system prompt and calls are parsed from text instead. The default `auto` asks
+  `GET /models` and uses the text protocol when the server is `boilerplate serve` (which reports
+  `owned_by: boilerplate` and has no native tool calling), native otherwise. In text mode the
+  request carries `stop: ["</tool_call>"]` and tool results are sent as user messages. Uses only the standard
   library (`urllib`), honours `HTTPS_PROXY`, verifies TLS, has a request timeout and a response
   size cap. The API key is read from the environment variable named by `api_key_env`; it is never
   written to config files, transcripts or logs. Plain `http://` is refused for non-loopback hosts
@@ -224,7 +227,6 @@ workspace bind-mounted and no network. The config has `sandbox.wrapper` (a comma
 boilerplate agent [--workspace DIR] [--endpoint URL --model NAME | --checkpoint DIR]
                   [--mode plan|default|accept-edits|auto] [--allow RULE]... [--deny RULE]...
                   [-p PROMPT] [--yes] [--resume ID] [--config FILE] [--max-steps N]
-boilerplate serve CHECKPOINT [--host 127.0.0.1] [--port 8000] [--api-key-env VAR]
 ```
 
 Slash commands: `/help`, `/exit`, `/clear`, `/compact`, `/mode MODE`, `/permissions`,
@@ -237,11 +239,11 @@ the session.
 
 ## 9. `boilerplate serve`
 
-Minimal OpenAI-compatible server over `Engine`: `GET /v1/models`, `POST /v1/chat/completions`
-(streaming and not), using the same chat template and text tool-call parser so `tools` work.
-Binds to 127.0.0.1 by default and refuses a non-loopback bind unless an API key is configured;
-compares keys in constant time; caps request body size, `max_tokens` and message count;
-serialises generation behind a lock. It is a development server, not a multi-tenant service.
+The engine's server (`boilerplate/serve.py`, from M4 and hardened in security review 2: API key
+with constant-time compare, refusal of public binds without a key, body/prompt/queue limits,
+sandboxed chat templates) is reused unchanged. The agent needs nothing from it beyond
+`/v1/chat/completions` with `stop` and `/v1/models`; tool calls ride the text protocol. Adding
+native `tools` support to the server is a follow-up.
 
 ## 10. Tests (mock model, CPU, no network)
 
@@ -257,11 +259,12 @@ serialises generation behind a lock. It is a development server, not a multi-ten
 - OpenAI backend against a local `http.server` stub: streaming text and streamed tool calls.
 - Agent loop end to end with a scripted model: read, edit, run tests, finish; step limit.
 - Compaction keeps tool-call pairs together. Transcripts are created with mode 0600.
-- `serve`: request validation and a round trip with a stub engine.
+- Compatibility with `boilerplate serve`: the agent's text-protocol request through `Server` with a stub
+  engine, streamed back and parsed into a tool call; the tool result reaches the engine prompt.
 
 ## 11. Acceptance criteria
 
-1. `pytest tests/test_agent*.py tests/test_serve.py` passes on CPU without network.
+1. `pytest tests/test_agent.py tests/test_agent_serve.py` passes on CPU without network.
 2. `boilerplate agent --endpoint http://127.0.0.1:8000/v1 --model x -p "list the files"` works
    against `boilerplate serve` on the tiny checkpoint (output will be nonsense; the plumbing is
    what is tested).
@@ -269,7 +272,7 @@ serialises generation behind a lock. It is a development server, not a multi-ten
    approval, which is checked by a test that runs every tool under `plan` and `default` mode with
    an always-deny prompter.
 
-Status 2026-11-06: all three hold on CPU (`tests/test_agent.py`, `tests/test_serve.py`; criterion 2
+Status 2026-11-06: all three hold on CPU (`tests/test_agent.py`, `tests/test_agent_serve.py`; criterion 2
 run by hand against `boilerplate make-tiny`, both through `serve` and with `--checkpoint`).
 
 ## 12. Follow-ups
@@ -277,9 +280,10 @@ run by hand against `boilerplate make-tiny`, both through `serve` and with `--ch
 - OS-level sandbox wrapper presets (bwrap, Docker) and a `--sandbox` flag.
 - Measure tool-use quality of Mode A against Mode C/D checkpoints on a small agentic benchmark
   once a chat-tuned checkpoint runs on the engine (fits the M5 report).
+- Native `tools` / `tool_calls` in `boilerplate serve`, so other OpenAI clients can use tools too.
 - MCP client support, so external tool servers can be attached under the same permission system.
 - A richer TUI (diff viewer, interruptible streaming display).
 - Regex search runs Python `re` on workspace files; a pathological pattern can still backtrack for
   a long time on one large file. A per-search time budget (or the `regex` module's timeout) would
   close that.
-- Include `boilerplate/agent/` and `boilerplate/serve.py` in the next whole-codebase security review.
+- Include `boilerplate/agent/` in the next whole-codebase security review.

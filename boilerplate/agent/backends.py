@@ -93,6 +93,23 @@ class OpenAIBackend(Backend):
             raise BackendError(f"environment variable {cfg.api_key_env} is not set")
         self.opener = opener or urllib.request.build_opener()
 
+    def _resolve_protocol(self) -> None:
+        """``auto``: ``boilerplate serve`` has no native tool calling, so use the text protocol there."""
+        if self.tool_protocol != "auto":
+            return
+        self.tool_protocol = "native"
+        headers = {"User-Agent": "boilerplate-agent/0.1"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(self.cfg.endpoint.rstrip("/") + "/models", headers=headers)
+        try:
+            with self.opener.open(req, timeout=min(self.cfg.timeout, 15)) as r:
+                data = json.loads(r.read(1 << 20))
+            if any(isinstance(m, dict) and m.get("owned_by") == "boilerplate" for m in data.get("data") or []):
+                self.tool_protocol = "text"
+        except (urllib.error.URLError, OSError, ValueError, AttributeError):
+            pass
+
     @property
     def remote(self) -> bool:
         return not _is_loopback(urllib.parse.urlsplit(self.url).hostname or "")
@@ -111,6 +128,7 @@ class OpenAIBackend(Backend):
         return p
 
     def chat(self, messages, tools, on_text=None) -> AssistantTurn:
+        self._resolve_protocol()
         body = json.dumps(self._payload(messages, tools)).encode()
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream, application/json",
                    "User-Agent": "boilerplate-agent/0.1"}

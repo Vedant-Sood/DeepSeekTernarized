@@ -75,7 +75,15 @@ def _tensor(value):
 
 
 def _match_alignment(value: torch.Tensor, target: int | None, alignment: int = 64) -> torch.Tensor:
-    """Match a CPU matrix's address alignment without changing its values."""
+    """Match a CPU matrix's address alignment without changing its values.
+
+    This is a reference-parity workaround, not a correctness requirement. Some CPU BLAS builds
+    (seen with MKL on AMD EPYC) choose a different FP32 reduction order for an operand whose
+    address is not 64-byte aligned, so an mmap'd matrix and the official reference's aligned copy
+    give results that differ in the last bits. Copying into aligned storage restores byte-identical
+    traces. It is tied to the BLAS build and CPU: if bit-exact comparisons start failing on a new
+    host, check alignment here first. GPU paths and tolerance-based comparisons do not need it.
+    """
     if target is None or value.device.type != "cpu":
         return value
     if target < 0 or target >= alignment or target % value.element_size():
@@ -241,7 +249,12 @@ class _NS:
 
 
 class V4Model:
-    def __init__(self, cfg: EngineConfig, weights: WeightStore, tokenizer=None, max_seq_len: int = 4096, dequant_cache_bytes: int = 2 << 30):
+    def __init__(self, cfg: EngineConfig, weights: WeightStore, tokenizer=None, max_seq_len: int = 4096, dequant_cache_bytes: int = 2 << 30,
+                 expert_cache_bytes: int | None = None):
+        from .expert_cache import ExpertCache
+
+        # routed experts are built on first use; this bounds how many stay materialized (None: all)
+        self.expert_cache = ExpertCache(host_bytes=expert_cache_bytes)
         self.cfg = cfg
         self.ternary_backend = "auto"
         QLinear.cache = DequantCache(dequant_cache_bytes) if dequant_cache_bytes else None
@@ -316,7 +329,7 @@ class V4Model:
             L.gate_w = g(f"{f}.gate.weight").float()
             L.gate_b = W.maybe(f"{f}.gate.bias")
             L.gate_b = L.gate_b.float() if L.gate_b is not None else None
-            L.experts = [None] * cfg.n_routed_experts  # built on first use; weights stay mmap'd
+            # routed experts are built on first use through self.expert_cache; weights stay mmap'd
             L.expert_prefix = f"{f}.experts"
             L.shared = tuple(lin(f"{f}.shared_experts.{w}") for w in ("w1", "w2", "w3"))
             L.engram = None
@@ -326,7 +339,7 @@ class V4Model:
                 E.index = self.engram_layout.layer_ids.index(i)
                 tm = W.mode_of(f"{e}.embed")
                 E.coded_table = f"{e}.embed" if f"{e}.embed.weight" in W.coded else None
-                if tm["mode"] == "C":  # ternary lookup table: rows are dequantized on lookup
+                if tm["mode"] in ("C", "D"):  # ternary lookup table: rows are dequantized on lookup
                     E.table = None
                     E.tq = [(g(f"{e}.embed.tq{i}.packed"), g(f"{e}.embed.tq{i}.scale")) for i in range(tm["terms"])]
                     E.tq_fmt, E.tq_group, E.tq_K = tm["packing"], tm["group"], tm["shape"][1]
@@ -347,7 +360,7 @@ class V4Model:
     def linear(self, base: str):
         """The linear for a weight base name, in whatever mode the checkpoint stores it."""
         m = self.w.mode_of(base)
-        if m["mode"] == "C":
+        if m["mode"] in ("C", "D"):
             terms = [PackedTerm(self.w.get(f"{base}.tq{i}.packed"), self.w.get(f"{base}.tq{i}.scale")) for i in range(m["terms"])]
             lin = TernaryLinear(terms, m["shape"][1], m["packing"], m["group"], act=m.get("act", "int8"), backend=self.ternary_backend)
         else:  # A, or B (WeightStore decodes B back to the original bytes)
@@ -356,10 +369,8 @@ class V4Model:
         return lin
 
     def expert(self, L, e: int):
-        if L.experts[e] is None:
-            pre = f"{L.expert_prefix}.{e}"
-            L.experts[e] = tuple(self.linear(f"{pre}.{w}") for w in ("w1", "w2", "w3"))
-        return L.experts[e]
+        pre = f"{L.expert_prefix}.{e}"
+        return self.expert_cache.get(pre, lambda: tuple(self.linear(f"{pre}.{w}") for w in ("w1", "w2", "w3")))
 
     def swiglu(self, ws, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
         w1, w2, w3 = ws
@@ -403,6 +414,7 @@ class V4Model:
                 continue
             idx, top = torch.where(indices == e)
             y[idx] += self.swiglu(self.expert(L, e), x[idx], weights[idx, top, None])
+            self.expert_cache.touch(f"{L.expert_prefix}.{e}")
         y += self.swiglu(L.shared, x)
         return y.type_as(x).view(shape)
 

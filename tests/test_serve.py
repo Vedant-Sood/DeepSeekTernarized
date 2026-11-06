@@ -1,131 +1,226 @@
-"""boilerplate serve and the in-process backend, with a stub engine (no weights needed)."""
-
-from __future__ import annotations
+"""OpenAI-compatible server on a tiny random Llama (request logic directly, plus one real HTTP round trip)."""
 
 import json
+import socket
 import threading
-import urllib.error
-import urllib.request
-from http.server import ThreadingHTTPServer
-from types import SimpleNamespace
+import time
 
 import pytest
 
-from boilerplate.agent.backends import BackendError, LocalEngineBackend, OpenAIBackend
-from boilerplate.agent.chat_format import ChatTemplate
-from boilerplate.agent.config import BackendConfig
-from boilerplate.engine.engine import GenerationResult
-from boilerplate.serve import ServeState, make_handler
+transformers = pytest.importorskip("transformers")
+
+from boilerplate.serve import RequestError, Server, _Decoder  # noqa: E402
+from boilerplate.testing.tiny import tiny_tokenizer  # noqa: E402
 
 
-class CharTokenizer:
-    def encode(self, text, add_special_tokens=True):
-        return SimpleNamespace(ids=[ord(c) for c in text])
+@pytest.fixture(scope="module")
+def server(tmp_path_factory):
+    from boilerplate.engine.standard import StandardEngine
+    from boilerplate.qat.smoke import tiny_model
+
+    path = tmp_path_factory.mktemp("serve_llama")
+    model = tiny_model("llama")
+    model.config.eos_token_id = 1
+    model.save_pretrained(path, safe_serialization=True)
+    tiny_tokenizer(64).save(str(path / "tokenizer.json"))
+    return Server(StandardEngine.load(path, max_seq_len=64), "tiny")
+
+
+def _prompt():
+    return "w1 w2 W3 w4"
+
+
+def test_completion_matches_engine_greedy(server):
+    out = server.complete({"prompt": _prompt(), "max_tokens": 8, "temperature": 0})
+    ids = server.encode(_prompt())
+    ref = server.engine.generate([ids], max_new_tokens=8, temperature=0.0).tokens[0]
+    eos = server.engine.cfg.eos_token_id
+    ref = ref[:ref.index(eos)] if eos in ref else ref
+    assert out["choices"][0]["text"] == server.engine.tokenizer.decode(ref)
+    assert out["usage"]["prompt_tokens"] == len(ids) and out["usage"]["completion_tokens"] == len(ref)
+    assert out["object"] == "text_completion" and out["model"] == "tiny"
+    echo = server.complete({"prompt": _prompt(), "max_tokens": 8, "temperature": 0, "echo": True})
+    assert echo["choices"][0]["text"] == _prompt() + out["choices"][0]["text"]
+
+
+def test_stream_equals_blocking_and_ends_with_finish_reason(server):
+    body = {"prompt": _prompt(), "max_tokens": 10, "temperature": 0}
+    full = server.complete(body)["choices"][0]
+    chunks = list(server.stream(body))
+    assert "".join(c["choices"][0]["text"] for c in chunks) == full["text"]
+    assert chunks[-1]["choices"][0]["finish_reason"] == full["finish_reason"]
+    assert all(c["choices"][0]["finish_reason"] is None for c in chunks[:-1])
+
+
+def test_stop_string_truncates_and_finishes(server):
+    full = server.complete({"prompt": _prompt(), "max_tokens": 12, "temperature": 0})["choices"][0]["text"]
+    words = full.split()
+    if len(words) < 3:
+        pytest.skip("greedy output too short to pick a stop word")
+    stop = words[2]
+    expected = full[:full.find(stop)]
+    out = server.complete({"prompt": _prompt(), "max_tokens": 12, "temperature": 0, "stop": stop})["choices"][0]
+    assert out["text"] == expected and out["finish_reason"] == "stop"
+    streamed = "".join(c["choices"][0]["text"] for c in server.stream(
+        {"prompt": _prompt(), "max_tokens": 12, "temperature": 0, "stop": [stop]}))
+    assert streamed == expected
+
+
+def test_sampled_choices_are_seeded(server):
+    body = {"prompt": _prompt(), "max_tokens": 6, "temperature": 1.0, "seed": 7, "n": 3}
+    a, b = server.complete(body), server.complete(body)
+    assert [c["text"] for c in a["choices"]] == [c["text"] for c in b["choices"]]
+    assert len(a["choices"]) == 3
+
+
+@pytest.mark.parametrize("body,match", [
+    ({"prompt": "w1", "top_p": 0.5}, "top_p"),
+    ({"prompt": "w1", "n": 2, "temperature": 0}, "temperature"),
+    ({"prompt": "w1", "max_tokens": -1}, "max_tokens"),
+    ({"prompt": ["w1", "w2"]}, "one string"),
+    ({"prompt": "w1", "stop": [""]}, "stop"),
+    ({"prompt": "w1", "max_tokens": 1000}, "limits"),
+])
+def test_invalid_requests(server, body, match):
+    with pytest.raises(RequestError, match=match):
+        server.complete(body)
+
+
+def test_chat_template_and_fallback(server):
+    msgs = [{"role": "system", "content": "w1"}, {"role": "user", "content": "w2 w3"}]
+    assert server.chat_prompt(msgs) == "system: w1\nuser: w2 w3\nassistant:"
+    templated = Server(server.engine, "tiny", chat_template=(
+        "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}"))
+    assert templated.chat_prompt(msgs) == "<system>w1<user>w2 w3<assistant>"
+    out = server.complete({"messages": msgs, "max_tokens": 4, "temperature": 0}, chat=True)
+    assert out["object"] == "chat.completion" and out["choices"][0]["message"]["role"] == "assistant"
+    chunks = list(server.stream({"messages": msgs, "max_tokens": 4, "temperature": 0}, chat=True))
+    assert chunks[0]["choices"][0]["delta"] == {"role": "assistant"}
+    assert "".join(c["choices"][0]["delta"].get("content", "") for c in chunks) == out["choices"][0]["message"]["content"]
+    with pytest.raises(RequestError):
+        server.chat_prompt([{"role": "wizard", "content": "x"}])
+
+
+class _CharTok:
+    def __init__(self, pieces):
+        self.pieces = pieces
 
     def decode(self, ids):
-        return "".join(chr(i) for i in ids)
+        return "".join(self.pieces[i] for i in ids)
 
 
-class StubEngine:
-    """Replies with the next scripted string, token by token, honouring the stream callback."""
-
-    def __init__(self, replies):
-        self.replies = list(replies)
-        self.tokenizer = CharTokenizer()
-        self.prompts = []
-
-    def generate(self, prompts, max_new_tokens=32, temperature=0.0, seed=None, eos_token_ids=None, stream=None):
-        self.prompts.append(self.tokenizer.decode(prompts[0]))
-        reply = self.replies.pop(0)
-        out = []
-        for t in [ord(c) for c in reply][:max_new_tokens]:
-            out.append(t)
-            if stream:
-                stream(0, t)
-        return GenerationResult([out], [len(out) < max_new_tokens])
+def test_decoder_holds_back_partial_stop_and_utf8():
+    d = _Decoder(_CharTok(["ab", "c", "X", "Y", "�"]), stop=["XY"])
+    assert d.push(0) == "ab" and d.push(1) == "c"
+    assert d.push(2) == ""  # could be the start of "XY"
+    assert d.push(3) == "" and d.stopped and d.text == "abc"
+    d = _Decoder(_CharTok(["ab", "�"]), stop=[])
+    assert d.push(0) == "ab" and d.push(1) == ""  # incomplete character held back
+    assert d.flush() == "�"
 
 
-CALL = '<tool_call>{"name": "read_file", "arguments": {"path": "a.py"}}</tool_call> trailing junk'
+def test_http_round_trip(server):
+    uvicorn = pytest.importorskip("uvicorn")
+    requests = pytest.importorskip("requests")
+    from boilerplate.serve import app
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    srv = uvicorn.Server(uvicorn.Config(app(server), host="127.0.0.1", port=port, log_level="warning"))
+    thread = threading.Thread(target=srv.run, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{port}"
+    try:
+        for _ in range(100):
+            if srv.started:
+                break
+            time.sleep(0.05)
+        assert requests.get(f"{base}/health").json() == {"status": "ok"}
+        assert requests.get(f"{base}/v1/models").json()["data"][0]["id"] == "tiny"
+        body = {"prompt": _prompt(), "max_tokens": 6, "temperature": 0}
+        full = requests.post(f"{base}/v1/completions", json=body).json()["choices"][0]["text"]
+        r = requests.post(f"{base}/v1/completions", json={**body, "stream": True}, stream=True)
+        assert r.headers["content-type"].startswith("text/event-stream")
+        events = [line[6:] for line in r.iter_lines(decode_unicode=True) if line.startswith("data: ")]
+        assert events[-1] == "[DONE]"
+        assert "".join(json.loads(e)["choices"][0]["text"] for e in events[:-1]) == full
+        bad = requests.post(f"{base}/v1/completions", json={"prompt": "w1", "top_p": 0.1})
+        assert bad.status_code == 400 and "top_p" in bad.json()["error"]["message"]
+        bad = requests.post(f"{base}/v1/chat/completions", json={"messages": [], "stream": True})
+        assert bad.status_code == 400
+        assert requests.get(f"{base}/stats").json()["requests"] >= 1
+    finally:
+        srv.should_exit = True
+        thread.join(timeout=10)
 
 
-def test_local_backend_text_protocol():
-    eng = StubEngine(["Let me read it.\n" + CALL])
-    b = LocalEngineBackend(BackendConfig(kind="local", max_tokens=500, max_seq_len=100_000), engine=eng,
-                           template=ChatTemplate())
-    seen = []
-    turn = b.chat([{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}],
-                  [{"type": "function", "function": {"name": "read_file", "description": "d", "parameters": {}}}],
-                  on_text=seen.append)
-    assert turn.text == "Let me read it." and turn.tool_calls[0].arguments == {"path": "a.py"}
-    assert "trailing junk" not in "".join(seen)  # generation stopped at </tool_call>
-    assert "## read_file" in eng.prompts[0] and eng.prompts[0].endswith("<|assistant|>\n")
-    tiny = LocalEngineBackend(BackendConfig(kind="local", max_seq_len=10), engine=StubEngine(["x"]),
-                              template=ChatTemplate())
-    with pytest.raises(BackendError, match="context"):
-        tiny.chat([{"role": "user", "content": "a long prompt"}], [])
+def test_chat_template_is_sandboxed(server):
+    # A malicious tokenizer_config.json chat template must not reach Python internals.
+    evil = Server(server.engine, "tiny", chat_template=(
+        "{{ messages.__class__.__mro__[1].__subclasses__() }}"))
+    with pytest.raises(RequestError, match="unsafe|template"):
+        evil.chat_prompt([{"role": "user", "content": "w1"}])
+    mutating = Server(server.engine, "tiny", chat_template="{{ messages.append(1) }}")
+    with pytest.raises(RequestError):
+        mutating.chat_prompt([{"role": "user", "content": "w1"}])
+    raising = Server(server.engine, "tiny", chat_template="{{ raise_exception('no system role') }}")
+    with pytest.raises(RequestError, match="no system role"):
+        raising.chat_prompt([{"role": "user", "content": "w1"}])
 
 
-@pytest.fixture
-def server():
-    eng = StubEngine([])
-    state = ServeState(eng, ChatTemplate(), "stub", max_seq_len=100_000, max_tokens_cap=1000, api_key="s3cret-key")
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    yield eng, f"http://127.0.0.1:{httpd.server_address[1]}"
-    httpd.shutdown()
+@pytest.mark.parametrize("body,match", [
+    ({"prompt": "w1", "max_tokens": True}, "max_tokens"),
+    ({"prompt": "w1", "n": True}, "`n`"),
+    ({"prompt": "w1", "seed": "7"}, "seed"),
+    ({"prompt": "w1", "seed": -1}, "seed"),
+    ({"prompt": "w1", "stop": 5}, "stop"),
+    ({"prompt": "w1", "stop": "x" * 1000}, "stop"),
+    ({"prompt": "w1", "temperature": False}, "temperature"),
+])
+def test_rejects_malformed_parameters(server, body, match):
+    with pytest.raises(RequestError, match=match):
+        server.complete(body)
 
 
-def _post(url, body, key="s3cret-key"):
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
-                                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
-    return urllib.request.urlopen(req, timeout=10)
+def test_prompt_length_is_bounded_before_tokenizing(server):
+    small = Server(server.engine, "tiny", max_prompt_chars=16)
+    with pytest.raises(RequestError, match="longer than"):
+        small.complete({"prompt": "w1 " * 100, "max_tokens": 1})
+    with pytest.raises(RequestError, match="longer than"):
+        small.complete({"messages": [{"role": "user", "content": "w1 " * 100}], "max_tokens": 1}, chat=True)
 
 
-def test_serve_auth_and_validation(server):
-    eng, base = server
-    with pytest.raises(urllib.error.HTTPError) as e:
-        _post(base + "/v1/chat/completions", {"messages": [{"role": "user", "content": "x"}]}, key="wrong")
-    assert e.value.code == 401
-    for bad in ({}, {"messages": []}, {"messages": [{"role": "evil", "content": "x"}]},
-                {"messages": [{"role": "user", "content": "x"}], "max_tokens": -1},
-                {"messages": [{"role": "user", "content": "x"}], "temperature": 9}):
-        with pytest.raises(urllib.error.HTTPError) as e:
-            _post(base + "/v1/chat/completions", bad)
-        assert e.value.code == 400
-    req = urllib.request.Request(base + "/v1/models", headers={"Authorization": "Bearer s3cret-key"})
-    assert json.load(urllib.request.urlopen(req))["data"][0]["id"] == "stub"
+def test_http_auth_body_limit_and_busy(server):
+    pytest.importorskip("starlette")
+    from starlette.testclient import TestClient
+
+    from boilerplate.serve import app, is_loopback
+
+    client = TestClient(app(server, api_key="s3cret", max_body_bytes=256))
+    assert client.get("/health").status_code == 200  # liveness stays open
+    assert client.get("/v1/models").status_code == 401
+    assert client.get("/stats", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    r = client.post("/v1/completions", json={"prompt": "w1", "max_tokens": 1})
+    assert r.status_code == 401 and r.headers["www-authenticate"] == "Bearer"
+    auth = {"Authorization": "Bearer s3cret"}
+    assert client.get("/v1/models", headers=auth).status_code == 200
+    ok = client.post("/v1/completions", json={"prompt": "w1", "max_tokens": 2, "temperature": 0}, headers=auth)
+    assert ok.status_code == 200
+    big = client.post("/v1/completions", json={"prompt": "w1 " * 200, "max_tokens": 1}, headers=auth)
+    assert big.status_code == 413
+    busy = TestClient(app(server, max_pending=0))
+    assert busy.post("/v1/completions", json={"prompt": "w1", "max_tokens": 1}).status_code == 503
+    assert is_loopback("127.0.0.1") and is_loopback("::1") and is_loopback("localhost")
+    assert not is_loopback("0.0.0.0") and not is_loopback("192.168.1.5")
 
 
-def test_serve_non_streaming(server):
-    eng, base = server
-    eng.replies.append("plain answer")
-    data = json.load(_post(base + "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}))
-    assert data["choices"][0]["message"]["content"] == "plain answer"
-    assert data["choices"][0]["finish_reason"] == "stop"
+def test_main_refuses_public_bind_without_key(monkeypatch):
+    import argparse
 
+    from boilerplate import serve
 
-def test_agent_backend_round_trip_through_serve(server, monkeypatch):
-    """OpenAI client (native tool calls, streaming) -> serve -> text protocol on the engine."""
-    eng, base = server
-    eng.replies.append("Checking.\n" + CALL)
-    monkeypatch.setenv("SERVE_KEY", "s3cret-key")
-    b = OpenAIBackend(BackendConfig(endpoint=base + "/v1", model="stub", api_key_env="SERVE_KEY"))
-    seen = []
-    tools = [{"type": "function", "function": {"name": "read_file", "description": "d", "parameters": {}}}]
-    turn = b.chat([{"role": "user", "content": "go"}], tools, on_text=seen.append)
-    assert "".join(seen).strip() == "Checking." and turn.text.strip() == "Checking."
-    assert turn.tool_calls[0].name == "read_file" and turn.tool_calls[0].arguments == {"path": "a.py"}
-    assert turn.finish_reason == "tool_calls"
-    # the follow-up request carries the tool result back; the engine sees it in the prompt
-    eng.replies.append("Done.")
-    msgs = [{"role": "user", "content": "go"}, turn.to_message(),
-            {"role": "tool", "tool_call_id": turn.tool_calls[0].id, "name": "read_file", "content": "FILE BODY"}]
-    turn2 = b.chat(msgs, tools)
-    assert turn2.text == "Done." and "FILE BODY" in eng.prompts[-1] and '"name": "read_file"' in eng.prompts[-1]
-
-
-def test_serve_refuses_public_bind_without_key(monkeypatch):
-    from boilerplate.serve import serve
-
-    with pytest.raises(SystemExit, match="non-loopback"):
-        serve("unused", host="0.0.0.0", engine=StubEngine([]), template=ChatTemplate())
+    monkeypatch.delenv("BOILERPLATE_API_KEY", raising=False)
+    a = argparse.Namespace(host="0.0.0.0", api_key=None, insecure_no_auth=False)
+    with pytest.raises(SystemExit, match="without an API key"):
+        serve.main(a)

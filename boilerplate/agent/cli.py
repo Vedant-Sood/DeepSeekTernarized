@@ -92,7 +92,8 @@ def build_parser(p: argparse.ArgumentParser | None = None) -> argparse.ArgumentP
     g.add_argument("--model", help="model name sent to the endpoint")
     g.add_argument("--api-key-env", help="environment variable holding the API key")
     g.add_argument("--checkpoint", help="run a Boilerplate checkpoint in-process instead of an endpoint")
-    g.add_argument("--tool-protocol", choices=["native", "text"], help="native tool calls or <tool_call> text")
+    g.add_argument("--tool-protocol", choices=["auto", "native", "text"],
+                   help="native tool calls or <tool_call> text (auto: text for boilerplate serve)")
     g.add_argument("--temperature", type=float)
     g.add_argument("--max-tokens", type=int)
     s = p.add_argument_group("permissions")
